@@ -12,12 +12,18 @@ Then:
 # SSH banner + HASSH-able KEXINIT
 nc 127.0.0.1 2222
 
-# DSM-looking login
+# Clinic Apache/PHP cover (not a NAS login)
 curl -s http://127.0.0.1:8080/ | head
 
-# Synology API catalog
-curl -s 'http://127.0.0.1:8080/webapi/query.cgi?api=SYNO.API.Info&query=ALL' | head
+# Soft-fail staff portal
+curl -s http://127.0.0.1:8080/portal/login.php | head
+
+# Public→privesc beat 1 — leaked staging config (example passwords only)
+curl -s http://127.0.0.1:8080/store/portal-config.js | head
 ```
 
-Planted passwords were printed when the sensor minted its state. Log in on
-the web UI, open File Station, read a bait file — that is R1b.
+Planted shell/File Station passwords were printed when the sensor minted its
+state. For the 3-beat staff-portal chain, use the **example** weak/backup
+credentials from `anglerfish/public_privesc/creds.py` (change them before any
+public bind). After escalate on `/staff/admin/term.php`, the sticky term UI
+hides user/pass and shows `escalated as lfield-backup · session sticky`.

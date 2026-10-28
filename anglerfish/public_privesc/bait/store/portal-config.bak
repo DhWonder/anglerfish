@@ -1,0 +1,9 @@
+# Example Clinic — portal staging config (DO NOT COMMIT)
+# Generated: 2026-10-12 by IT overnight backup
+portal_env=staging
+portal_url=/portal/login.php
+staff_user=mjones
+staff_pass=StagingWinter.example
+note=portal v2 staging — rotate after cutover
+db_host=127.0.0.1
+db_name=clinic_portal_stg

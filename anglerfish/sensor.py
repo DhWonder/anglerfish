@@ -49,6 +49,8 @@ import shlex
 
 from . import bait
 from . import dsm
+from . import vhosts
+from . import phpapp
 from . import events as events_module
 from . import persona as persona_module
 from . import shellfake
@@ -58,7 +60,7 @@ from . import tlsfp
 _EPHEMERAL_KEYS = None  # lazy HostKeys for tests (persona=False)
 
 
-BANNER = "SSH-2.0-OpenSSH_8.9p1 Ubuntu-3ubuntu0.6"  # overridden by bait.SSH_BANNER when a persona is loaded
+BANNER = "SSH-2.0-OpenSSH_8.9p1 Ubuntu-3ubuntu0.6"
 READ_LIMIT = 4096
 SESSION_IDLE = 120
 HTTP_GLANCE = 0.35
@@ -163,7 +165,7 @@ class Sensor(object):
 
     def __init__(self, name="", console="", log_path="", ports=None, bind="0.0.0.0",
                  status_path="", persona=None, classroom=False, console_token="",
-                 state_dir="", drop_user="", config_path=""):
+                 state_dir="", drop_user="", config_path="", https_redirect=None):
         self.name = name or socket.gethostname()
         self.console = console.rstrip("/")
         self.log_path = log_path or os.path.expanduser("~/.anglerfish/sessions.log")
@@ -173,6 +175,15 @@ class Sensor(object):
         self.classroom = bool(classroom)
         self.state_dir = state_dir or os.path.expanduser("~/.anglerfish")
         self.drop_user = drop_user or ""
+        if https_redirect is None:
+            env = os.environ.get("ANGLERFISH_HTTPS_REDIRECT", "").strip().lower()
+            if env in ("0", "false", "no", "off"):
+                https_redirect = False
+            elif env in ("1", "true", "yes", "on"):
+                https_redirect = True
+            else:
+                https_redirect = True
+        self.https_redirect = bool(https_redirect)
         # Persona: mint or load a stable identity so installs are not twins.
         # Pass persona=False to keep the built-in example persona defaults (tests).
         if persona is None:
@@ -238,6 +249,7 @@ class Sensor(object):
                     pass
                 self._ssl_ctx = ctx
                 self._tls_cert, self._tls_key = cert, key
+                self._install_sni_contexts(ctx)
                 try:
                     with open(cert, "rb") as fh:
                         der = ssl.PEM_cert_to_DER_cert(fh.read().decode("ascii"))
@@ -509,7 +521,7 @@ class Sensor(object):
                 # SSH ports speak SSH only. Banner immediately (no delay),
                 # then Protocol mismatch for anything that is not SSH-2.
                 try:
-                    conn.sendall((bait.SSH_BANNER + "\r\n").encode("ascii"))
+                    conn.sendall((BANNER + "\r\n").encode("ascii"))
                 except OSError:
                     return
                 intro = _read_prelude(conn)
@@ -914,7 +926,7 @@ class Sensor(object):
             state["cwd"] = cwd
             return reply or ""
 
-        sshproto.serve(conn, intro, bait.SSH_BANNER, {
+        sshproto.serve(conn, intro, BANNER, {
             "banner": banner,
             "kexinit": kexinit,
             "pubkey": pubkey,
@@ -927,7 +939,7 @@ class Sensor(object):
 
     def _smtp(self, conn, session):
         fqdn = self.world.get("fqdn") or self.world["hostname"]
-        _send(conn, bait.smtp_banner() + "\r\n")
+        _send(conn, "220 %s ESMTP Postfix (Ubuntu)\r\n" % fqdn)
         while self.running:
             line = _line(conn)
             if line is None:
@@ -972,7 +984,7 @@ class Sensor(object):
 
     def _ftp(self, conn, session):
         fqdn = self.world.get("fqdn") or self.world["hostname"]
-        _send(conn, bait.ftp_banner() + "\r\n")
+        _send(conn, "220 %s FTP server (vsftpd 3.0.5) ready.\r\n" % fqdn)
         user = ""
         while self.running:
             line = _line(conn)
@@ -1152,6 +1164,77 @@ class Sensor(object):
             return row["user"], token, row
         return "", token, row
 
+    def _install_sni_contexts(self, default_ctx):
+        """Per-role certs (separate LE lineages so one cert doesn't list every
+        name in CT). SNI picks the context; IP/unknown/no SNI keeps the
+        default (apex+www) cert."""
+        self._sni_ctx = {}
+        for role, stem in (("files", "tls-files"), ("staff", "tls-staff")):
+            c = os.path.join(self.state_dir, stem + "-cert.pem")
+            k = os.path.join(self.state_dir, stem + "-key.pem")
+            if not (os.path.exists(c) and os.path.exists(k)):
+                continue
+            try:
+                x = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+                x.minimum_version = ssl.TLSVersion.TLSv1_2
+                x.load_cert_chain(c, k)
+                try:
+                    x.set_alpn_protocols(["http/1.1"])
+                except (NotImplementedError, ssl.SSLError, AttributeError):
+                    pass
+                self._sni_ctx[role] = x
+            except Exception:
+                pass
+        if not self._sni_ctx:
+            return
+        domain = (self.world.get("domain") or "").lower()
+        label_ctx = {"files": "files", "srv-files": "files",
+                     "portal": "staff", "billing": "staff", "mail": "staff"}
+
+        def _pick(sslobj, server_name, _ctx):
+            try:
+                name = (server_name or "").lower().rstrip(".")
+                # No SNI / IP-literal SNI = someone hitting the box by IP ->
+                # the NAS (files/srv-files) cert, same as files.*.
+                if (not name or all(c in "0123456789." for c in name)
+                        or ":" in name):
+                    if "files" in self._sni_ctx:
+                        sslobj.context = self._sni_ctx["files"]
+                    return None
+                if domain and name.endswith("." + domain):
+                    role = label_ctx.get(name[: -(len(domain) + 1)])
+                    if role and role in self._sni_ctx:
+                        sslobj.context = self._sni_ctx[role]
+            except Exception:
+                pass
+            return None
+
+        try:
+            default_ctx.sni_callback = _pick
+        except Exception:
+            pass
+
+    def _plain_server_host(self, host_header):
+        """apex/www and every NAS-facing Host (files/srv-files, fqdn, bare IP,
+        no Host, dotless LAN name) run with server_tokens off -> 'nginx'."""
+        host = (host_header or "").strip().lower()
+        if host.startswith("["):
+            return True  # IPv6 literal
+        host = host.split(":")[0].rstrip(".")
+        if not host or "." not in host or all(c in "0123456789." for c in host):
+            return True
+        domain = (self.world.get("domain") or "").lower()
+        fqdn = (self.world.get("fqdn") or "").lower()
+        if fqdn and host == fqdn:
+            return True
+        if not domain:
+            return False
+        if host in (domain, "www." + domain):
+            return True
+        if host.endswith("." + domain):
+            return host[: -(len(domain) + 1)] in vhosts.SERVED_LABELS
+        return False
+
     def _known_host(self, host_header):
         """True when Host looks like this NAS; False -> nginx default-server."""
         if not host_header:
@@ -1168,12 +1251,27 @@ class Sensor(object):
         domain = (self.world.get("domain") or "").lower()
         if host == fqdn or host == hostname or host.startswith(hostname + "."):
             return True
-        if domain and (host == domain or host.endswith("." + domain)):
+        if domain and host == domain:
             return True
+        # Only the vhosts we actually serve; other *.domain -> nginx default-server
+        # (matches a real nginx with explicit server_names).
+        if domain and host.endswith("." + domain):
+            label = host[: -(len(domain) + 1)]
+            if label in vhosts.SERVED_LABELS:
+                return True
         return False
 
     def _web(self, conn, first, session):
-        head, body = _http_head_and_body(conn, first)
+        _hb = _http_head_and_body(conn, first)
+        if len(_hb) == 6:
+            head, body, declared_length, _drained, _drain_capped, _hb_meta = _hb
+        else:  # pragma: no cover
+            head, body, declared_length, _drained, _drain_capped = _hb
+            _hb_meta = {}
+        session["http_declared_length"] = declared_length
+        session["body_drained_bytes"] = _drained
+        session["body_drain_capped"] = _drain_capped
+        session["http_body_meta"] = _hb_meta or {}
         request_line = head.split(b"\r\n", 1)[0].decode("latin-1", "replace")
         session["events"].append(_event("http", request_line[:500]))
         ua = host_header = referer = content_type = ""
@@ -1190,6 +1288,8 @@ class Sensor(object):
                 referer = line.split(b":", 1)[1].decode("latin-1", "replace").strip()
             elif low.startswith(b"content-type:"):
                 content_type = line.split(b":", 1)[1].decode("latin-1", "replace").strip()
+            elif low.startswith(b"cookie:"):
+                session["http_cookie"] = line.split(b":", 1)[1].decode("latin-1", "replace").strip()
         try:
             method, path, version = request_line.split(" ", 2)
         except ValueError:
@@ -1234,16 +1334,56 @@ class Sensor(object):
             _send_raw(conn, _http_response(400, "text/html", payload, head_only=False))
             return
 
-        # Unknown Host -> nginx default-server (deception tell).
+        # Unknown Host -> Apache/nginx default-server.
+        # Stock default_server serves welcome at "/" only and 404s elsewhere
+        # (Nmap http-enum tell when every path returns 200).
         if not self._known_host(host_header):
-            payload = dsm.nginx_default_html().encode("utf-8")
-            _send_raw(conn, _http_response(200, "text/html", payload, head_only=False))
+            ds_path = path.split("?", 1)[0]
+            if method in ("GET", "HEAD") and ds_path in ("/", "/index.html", "/index.htm"):
+                payload = phpapp.default_server_html().encode("utf-8")
+                ds_status = 200
+            else:
+                payload = phpapp.apache_error(404, "Not Found")
+                ds_status = 404
+            if isinstance(payload, str):
+                payload = payload.encode("utf-8")
+            _send_raw(conn, _http_response(ds_status, "text/html", payload,
+                                           head_only=(method == "HEAD"),
+                                           server=phpapp.APACHE_SERVER))
             try:
                 self.events.emit(
                     "http", service="http", session=session,
-                    http_method=method, http_path=path[:200], http_status=200,
+                    http_method=method, http_path=path[:200], http_status=ds_status,
                     uri_len=uri_len, host_header=host_header, user_agent=ua[:200],
                     tags=["default-server"],
+                )
+            except Exception:
+                pass
+            return
+
+        # Domain Host over plain HTTP -> 301 to HTTPS (bare IP stays on HTTP).
+        _h = (host_header or "").split(":")[0].strip().lower()
+        _dom = (self.world.get("domain") or "").lower()
+        if (self.https_redirect and self._ssl_ctx is not None
+                and session.get("local_port") not in HTTPS_PORTS and _dom
+                and (_h == _dom or _h.endswith("." + _dom))):
+            payload = _nginx_error(301, "Moved Permanently")
+            if isinstance(payload, str):
+                payload = payload.encode("utf-8")
+            _srv = _SERVER_FULL
+            if self._plain_server_host(host_header):
+                _srv = "nginx"
+                payload = _plain_server_payload(payload)
+            _send_raw(conn, _http_response(301, "text/html", payload,
+                                           head_only=(method == "HEAD"),
+                                           extra="Location: https://%s%s\r\n" % (_h, path or "/"),
+                                           server=_srv))
+            try:
+                self.events.emit(
+                    "http", service="http", session=session,
+                    http_method=method, http_path=path[:200], http_status=301,
+                    uri_len=uri_len, host_header=host_header, user_agent=ua[:200],
+                    tags=["https-redirect"],
                 )
             except Exception:
                 pass
@@ -1261,6 +1401,106 @@ class Sensor(object):
                 })
             _tag_http_exploit(session, path, posted)
 
+        # PHP2Shell lure: flag session-upload-progress / oversized PHPSESSID.
+        # Log payload URLs but NEVER fetch them / never contact attacker infra.
+        try:
+            p2s = phpapp.inspect_php2shell(
+                head.decode("latin-1", "replace"),
+                body,
+                declared_length=session.get("http_declared_length") or 0,
+                cookies=session.get("http_cookie") or "",
+            )
+            # Profile P1: chunked-without-CL + incomplete worker-hold tags
+            _meta = session.get("http_body_meta") or {}
+            if _meta.get("chunked_no_cl"):
+                tags = list(p2s.get("tags") or [])
+                if "php2shell-chunked-no-cl" not in tags:
+                    tags.append("php2shell-chunked-no-cl")
+                p2s["tags"] = tags
+                reasons = list(p2s.get("reasons") or [])
+                if "chunked_no_cl" not in reasons:
+                    reasons.append("chunked_no_cl")
+                p2s["reasons"] = reasons
+                p2s["hit"] = True
+                session["events"].append(_event(
+                    "php2shell-chunked-no-cl",
+                    "te=chunked; no content-length"))
+            if _meta.get("worker_hold"):
+                tags = list(p2s.get("tags") or [])
+                if "php2shell-worker-hold" not in tags:
+                    tags.append("php2shell-worker-hold")
+                p2s["tags"] = tags
+                p2s["hit"] = True
+                session["events"].append(_event(
+                    "php2shell-worker-hold",
+                    (_meta.get("worker_hold_reason")
+                     or "idle_timeout")[:80]))
+            session["php2shell"] = p2s
+            if p2s.get("hit"):
+                session["events"].append(_event(
+                    "php2shell", ",".join(p2s.get("reasons") or [])[:200]))
+                for u in (p2s.get("payload_urls") or [])[:3]:
+                    session["events"].append(_event(
+                        "php2shell-url-logged", u[:200]))
+                if p2s.get("stage"):
+                    session["events"].append(_event(
+                        "php2shell-stage", (p2s.get("stage") or "")[:80]))
+        except Exception:
+            p2s = {"hit": False, "tags": [], "stages": []}
+
+        # S5 / drop-path dictionary: log ALL probes (allowlist + broader set),
+        # even when response will be 404. Never execute.
+        try:
+            from . import php2shell_chain as _p2s_chain
+        except Exception:
+            _p2s_chain = None
+        try:
+            _cpath = (path or "").split("?", 1)[0]
+            _is_canary = _cpath in getattr(phpapp, "PHP2SHELL_CANARY_PATHS", ())
+            _is_drop = False
+            if _p2s_chain is not None:
+                _is_drop = _p2s_chain.is_drop_probe_path(_cpath)
+            if _is_canary or _is_drop:
+                p2s = dict(session.get("php2shell") or p2s or {})
+                tags = list(p2s.get("tags") or [])
+                for t in ("php2shell-post-rce-probe", "php2shell-canary-hit",
+                          "php2shell-drop-probe"):
+                    if t not in tags:
+                        # canary-hit only for allowlisted paths
+                        if t == "php2shell-canary-hit" and not _is_canary:
+                            continue
+                        tags.append(t)
+                stages = list(p2s.get("stages") or [])
+                if "post_rce_probe" not in stages:
+                    stages.append("post_rce_probe")
+                if "drop_probe" not in stages:
+                    stages.append("drop_probe")
+                probed = list(p2s.get("drop_paths_probed") or [])
+                if _cpath not in probed:
+                    probed.append(_cpath[:200])
+                p2s.update({
+                    "hit": True,
+                    "tags": tags,
+                    "stages": stages,
+                    "stage": "post_rce_probe" if _is_canary else "drop_probe",
+                    "response_shape": (
+                        "canary_stub" if _is_canary else "drop_probe_404"),
+                    "canary_path": _cpath if _is_canary else None,
+                    "drop_paths_probed": probed[-32:],
+                    "php2shell_drop_probe": _cpath,
+                })
+                session["php2shell"] = p2s
+                session["events"].append(_event(
+                    "php2shell_drop_probe", _cpath[:200]))
+                if _is_canary:
+                    session["events"].append(_event(
+                        "php2shell-canary", _cpath[:200]))
+                if _p2s_chain is not None:
+                    _p2s_chain.note_drop_probe(
+                        (p2s.get("phpsessid_echo") or "")[:128], _cpath)
+        except Exception:
+            pass
+
         _tag_http_exploit(session, path, "")
 
         web_user, web_token, web_row = self._web_user_from_headers(head)
@@ -1275,7 +1515,8 @@ class Sensor(object):
 
         page, ctype, code, set_cookie, extra_headers = self._page(
             path, session, method, body, web_user=web_user,
-            web_token=web_token, web_row=web_row)
+            web_token=web_token, web_row=web_row,
+            host_header=host_header)
 
         clean_path = path.split("?", 1)[0]
         query = path.split("?", 1)[1] if "?" in path else ""
@@ -1285,6 +1526,35 @@ class Sensor(object):
             syno_api = (qs.get("api") or [""])[0]
             syno_method = (qs.get("method") or [""])[0]
             syno_version = (qs.get("version") or [""])[0]
+        _dsm_surface = bool(session.get("dsm_surface"))
+        _http_tags = []
+        if "/webapi/" in clean_path or "/webman/" in clean_path:
+            # Page-load assets must not trip high-signal (login.js / login.cgi GET).
+            if method in ("GET", "HEAD") and (
+                    clean_path in ("/webman/login.js", "/webman/login.cgi",
+                                   "/scripts/synology/dist/login.js")
+                    or clean_path.startswith("/scripts/synology/")):
+                _http_tags.append("dsm-page-asset")
+            elif _dsm_surface:
+                _http_tags.append("high-synology-webapi")
+            else:
+                _http_tags.append("synology-probe-offsurface")
+        if phpapp.is_page_asset(clean_path, method):
+            _http_tags.append("php-page-asset")
+        p2s = session.get("php2shell") or {}
+        if p2s.get("hit"):
+            _http_tags.extend(p2s.get("tags") or ["php2shell-probe"])
+        # Public->privesc bait tags (from phpapp/public_privesc adapter)
+        for _bt in (session.get("bait_tags") or []):
+            if _bt and _bt not in _http_tags:
+                _http_tags.append(_bt)
+        if ((method == "POST" and clean_path in (
+                "/login.php", "/upload.php", "/admin/login.php",
+                "/webman/login.cgi")) or (
+                method in ("GET", "POST") and "/webapi/auth.cgi" in clean_path)):
+            if "php-page-asset" not in _http_tags and "dsm-page-asset" not in _http_tags:
+                _http_tags.append("high-login-or-api")
+        _http_tags = _http_tags or None
         req_line_cap = request_line[:events_module.REQUEST_LINE_CAP]
         body_text, body_enc, body_len, _body_trunc = events_module.capture_bytes(
             body or b"", events_module.BODY_CAP)
@@ -1309,11 +1579,61 @@ class Sensor(object):
                 syno_token=(web_row or {}).get("synotoken") if web_row else None,
                 session_material_presented=bool(web_token),
                 session_material_valid=bool(web_user),
+                session_material_known=bool(web_row),
+                http_vhost_role=session.get("http_vhost_role") or None,
+                dsm_surface=_dsm_surface,
+                dsm_page_asset=("dsm-page-asset" in (_http_tags or [])),
+                php2shell=bool(p2s.get("hit")),
+                php2shell_reasons=p2s.get("reasons") or None,
+                php2shell_stage=(
+                    session.get("php2shell_stage") or p2s.get("stage") or None),
+                php2shell_stages=p2s.get("stages") or None,
+                php2shell_t_array_count=p2s.get("t_array_count"),
+                php2shell_file_parts=p2s.get("file_parts"),
+                php2shell_progress_name=(p2s.get("progress_name") or None),
+                php2shell_payload_urls=p2s.get("payload_urls") or None,
+                php2shell_response_shape=(
+                    session.get("php2shell_response_shape")
+                    or p2s.get("response_shape") or None),
+                php2shell_canary_path=p2s.get("canary_path") or None,
+                php2shell_sessid_len=p2s.get("phpsessid_len"),
+                php2shell_drop_probe=p2s.get("php2shell_drop_probe") or None,
+                drop_paths_probed=p2s.get("drop_paths_probed") or None,
+                campaign_key=(session.get("php2shell_research") or {}).get(
+                    "campaign_key") or p2s.get("campaign_key"),
+                sess_family=(session.get("php2shell_research") or {}).get(
+                    "sess_family") or p2s.get("sess_family"),
+                stage_delta_ms=(session.get("php2shell_research") or {}).get(
+                    "stage_delta_ms"),
+                body_sample_sha256=(session.get("php2shell_research") or {}).get(
+                    "body_sample_sha256"),
+                body_sample_path=(session.get("php2shell_research") or {}).get(
+                    "body_sample_path"),
+                body_sample_len=(session.get("php2shell_research") or {}).get(
+                    "body_sample_len"),
+                multipart_filenames=(session.get("php2shell_research") or {}).get(
+                    "multipart_filenames"),
+                multipart_field_names=(
+                    session.get("php2shell_research") or {}).get(
+                    "multipart_field_names"),
+                phpsessid_sha256=(session.get("php2shell_research") or {}).get(
+                    "phpsessid_sha256"),
+                phpsessid_head_tail=(
+                    session.get("php2shell_research") or {}).get(
+                    "phpsessid_head_tail"),
+                content_length_declared=session.get("http_declared_length") or 0,
+                body_prefix_len=len(body or b""),
+                body_drained_bytes=session.get("body_drained_bytes") or 0,
+                body_drain_capped=bool(session.get("body_drain_capped")),
+                tls_ja3=session.get("tls_ja3") or None,
+                tags=_http_tags,
             )
         except Exception:
             pass
 
         extra = ""
+        if session.get("http_vhost_role") in ("clinic", "portal", "billing", "mail"):
+            set_cookie = ""  # DSM cookies only on the NAS hosts
         if set_cookie:
             row = {}
             with self._lock:
@@ -1324,15 +1644,39 @@ class Sensor(object):
             if row.get("auth_ok"):
                 extra += "Set-Cookie: stay_login=1; Path=/\r\n"
         if code == 302:
-            extra += "Location: /files/\r\n"
+            _has_loc = any(
+                (h or "").lower().startswith("location:")
+                for h in (extra_headers or []))
+            if not _has_loc:
+                extra += "Location: /files/\r\n"
         for hdr in (extra_headers or []):
             extra += hdr if hdr.endswith("\r\n") else (hdr + "\r\n")
         if isinstance(page, (bytes, bytearray)):
             payload = bytes(page)
         else:
             payload = page.encode("utf-8")
+        role_now = session.get("http_vhost_role") or ""
+        if role_now in ("clinic", "portal", "billing", "mail", "files", "php"):
+            _srv = phpapp.APACHE_SERVER
+            # Ensure X-Powered-By on PHP surfaces when handler didn't set it.
+            # Red Delta B: raw sess_* omit it (bare text/plain / research flag).
+            _omit_xpb = (
+                session.get("php2shell_response_shape") == "session_blob"
+                and (
+                    (session.get("php2shell_research") or {}).get(
+                        "omit_x_powered_by")
+                    or ((ctype or "").strip() == "text/plain")
+                )
+            )
+            if not _omit_xpb and "X-Powered-By:" not in extra:
+                extra += "X-Powered-By: %s\r\n" % phpapp.X_POWERED_BY
+        else:
+            _srv = _SERVER_FULL
+            if self._plain_server_host(host_header):
+                _srv = "Apache"
         _send_raw(conn, _http_response(code, ctype, payload,
-                                       head_only=(method == "HEAD"), extra=extra))
+                                       head_only=(method == "HEAD"), extra=extra,
+                                       server=_srv))
 
     def _web_revealed(self, token):
         if not token:
@@ -1350,7 +1694,7 @@ class Sensor(object):
                 row["revealed"] = True
 
     def _page(self, path, session, method="GET", body=b"", web_user="",
-              web_token="", web_row=None):
+              web_token="", web_row=None, host_header=""):
         """Return (body, content_type, status_code, set_cookie_token, extra_headers).
 
         set_cookie_token is our internal nas_session token (or "" if none);
@@ -1365,6 +1709,123 @@ class Sensor(object):
         authed = bool(web_user) or bool(session.get("auth_ok"))
         set_cookie = ""
         web_row = web_row or {}
+
+        # ---- Per-Host decoy sites (clinic / portal / billing / mail) ----
+        # files./srv-files. (and bare IP) fall through to Synology DSM below.
+        # Soft-fail hosts never mint File Station sessions.
+        role = vhosts.role_for_host(
+            host_header,
+            domain=self.world.get("domain") or "",
+            fqdn=self.world.get("fqdn") or "",
+            hostname=self.world.get("hostname") or "",
+        )
+        # Sunday overhaul: Synology NAS cover retired (NAS-on-AWS-IP tell).
+        # Opt back in with ANGLERFISH_ALLOW_DSM=1.
+        allow_dsm = os.environ.get("ANGLERFISH_ALLOW_DSM", "").strip().lower() in (
+            "1", "true", "yes", "on")
+        if role == "files" and not allow_dsm:
+            role = "php"  # staff PHP portal instead of DSM
+        session["http_vhost_role"] = role
+        # DSM surface only when explicitly allowed and role is files.
+        session["dsm_surface"] = bool(allow_dsm and role == "files")
+        if (role == "clinic" and method == "POST"
+                and clean in vhosts.CONTACT_PATHS):
+            fields = {}
+            try:
+                for k, v in urllib.parse.parse_qsl(
+                        (body or b"").decode("utf-8", "replace"),
+                        keep_blank_values=True):
+                    if k in ("name", "email", "message") and k not in fields:
+                        fields[k] = v
+            except Exception:
+                pass
+            session["events"].append(_event(
+                "http-contact-form", (fields.get("email") or "")[:120]))
+            try:
+                self.events.emit(
+                    "contact_form", service="http", session=session,
+                    http_method=method, http_path=clean[:200],
+                    host_header=host_header, tags=["contact-form"],
+                    contact_name=(fields.get("name") or "")[:200],
+                    contact_email=(fields.get("email") or "")[:200],
+                    contact_message=(fields.get("message") or "")[:2000],
+                    contact_message_len=len(fields.get("message") or ""),
+                )
+            except Exception:
+                pass
+            return vhosts.contact_thanks(self.world)
+        if role == "php":
+            failed = (method == "POST" and phpapp.PHP_LOGIN in (clean, path.split("?",1)[0]))
+            if failed:
+                session["events"].append(_event("http-softfail-login", "php %s" % path[:120]))
+            world = dict(self.world or {})
+            world["http_declared_length"] = session.get("http_declared_length") or 0
+            world["http_cookie"] = session.get("http_cookie") or ""
+            world["php2shell"] = session.get("php2shell") or {}
+            world["src_ip"] = session.get("peer_ip") or ""
+            world["http_ua"] = session.get("http_user_agent") or session.get("user_agent") or ""
+            world["http_hostname"] = (
+                self.world.get("hostname") or "ip-10-0-0-21")
+            handled = phpapp.staff_files_portal(
+                path, method=method, body=body, world=world, failed=failed)
+            if handled is not None:
+                if isinstance(world.get("php2shell_research"), dict):
+                    session["php2shell_research"] = world["php2shell_research"]
+                if world.get("php2shell_stage"):
+                    session["php2shell_stage"] = world["php2shell_stage"]
+                if world.get("php2shell_response_shape"):
+                    session["php2shell_response_shape"] = world[
+                        "php2shell_response_shape"]
+                if world.get("bait_tags"):
+                    session["bait_tags"] = list(world.get("bait_tags") or [])
+                if world.get("bait_events"):
+                    session["bait_events"] = list(world.get("bait_events") or [])
+                page, ctype, code, set_cookie, extra_headers = handled
+                return page, ctype, code, set_cookie, extra_headers
+            # Unknown path on php surface -> Apache 404
+            return (phpapp.apache_error(404, "Not Found"), "text/html", 404, "",
+                    phpapp.apache_headers())
+        if role == "clinic":
+            # Prefer PHP clinic surfaces (login/upload/phpinfo/.env) over static-only.
+            failed = (method == "POST" and clean in (
+                phpapp.PHP_LOGIN, "/login", "/admin/login.php"))
+            world = dict(self.world or {})
+            world["http_declared_length"] = session.get("http_declared_length") or 0
+            world["http_cookie"] = session.get("http_cookie") or ""
+            world["php2shell"] = session.get("php2shell") or {}
+            world["src_ip"] = session.get("peer_ip") or ""
+            world["http_ua"] = session.get("http_user_agent") or session.get("user_agent") or ""
+            world["http_hostname"] = (
+                self.world.get("hostname") or "ip-10-0-0-21")
+            world["php2shell_apply_delay"] = True
+            handled = phpapp.handle(
+                path, method=method, body=body, world=world, failed=failed,
+                role="clinic")
+            if handled is not None:
+                # Pull research capture / stage back onto the session.
+                if isinstance(world.get("php2shell_research"), dict):
+                    session["php2shell_research"] = world["php2shell_research"]
+                if world.get("php2shell_stage"):
+                    session["php2shell_stage"] = world["php2shell_stage"]
+                if world.get("php2shell_response_shape"):
+                    session["php2shell_response_shape"] = world[
+                        "php2shell_response_shape"]
+                if world.get("bait_tags"):
+                    session["bait_tags"] = list(world.get("bait_tags") or [])
+                if world.get("bait_events"):
+                    session["bait_events"] = list(world.get("bait_events") or [])
+                page, ctype, code, set_cookie, extra_headers = handled
+                return page, ctype, code, set_cookie, extra_headers
+        if role != "unknown":
+            failed = (method == "POST" and role in ("portal", "billing", "mail")
+                      and vhosts.soft_fail_login(path, method, body))
+            if failed:
+                session["events"].append(_event("http-softfail-login", "%s %s" % (role, path[:120])))
+            handled = vhosts.handle(
+                role, path, method=method, body=body,
+                world=self.world, failed=failed)
+            if handled is not None:
+                return handled
 
         # ---- Synology DSM webapi / webman (deception: Synology surface) ----
         if clean in ("/webapi/query.cgi", "/webapi/entry.cgi",
@@ -1676,7 +2137,7 @@ class Sensor(object):
             headers = {"Content-Type": "application/json",
                        "User-Agent": "python-urllib3/1.26"}
             if self.console_token:
-                headers["X-Anglerfish-Token"] = self.console_token
+                headers["X-Decoy-Token"] = self.console_token
             request = urllib.request.Request(
                 self.console + path, data=data, headers=headers)
             urllib.request.urlopen(request, timeout=5).read()
@@ -1842,9 +2303,20 @@ def _line(conn, pre=b""):
     return bytes(buffer).decode("latin-1", "replace").rstrip("\r")
 
 def _http_head_and_body(conn, first):
-    # Allow a larger head so over-long URIs can fire a 414 instead of being
-    # silently truncated. Body remains capped at READ_LIMIT.
+    """Return (head, body_prefix, declared_length, drained_bytes, drain_capped, meta).
+
+    meta may include: chunked_no_cl, worker_hold (incomplete POST idle timeout).
+    Inspect prefix hard-capped at phpapp.BODY_PREFIX_CAP (256KiB research).
+    Never buffer ~140MB. Profile P1: accept Transfer-Encoding: chunked without
+    Content-Length. After prefix, drain remaining under time/byte cap (FIN).
+    """
+    import time as _time
     head_cap = max(READ_LIMIT, MAX_URI_LEN + 2048)
+    body_cap = getattr(phpapp, "BODY_PREFIX_CAP", READ_LIMIT)
+    drain_byte_cap = 8 * 1024 * 1024  # hard max discard
+    drain_time_cap = 3.0
+    chunked_idle_timeout = 2.0
+    meta = {}
     data = bytearray(first)
     while b"\r\n\r\n" not in data and len(data) < head_cap:
         try:
@@ -1858,30 +2330,146 @@ def _http_head_and_body(conn, first):
             break
     raw = bytes(data)
     if b"\r\n\r\n" not in raw:
-        return raw, b""
+        return raw, b"", 0, 0, False, meta
     head, body = raw.split(b"\r\n\r\n", 1)
-    length = None
+    declared = 0
+    te_chunked = False
     for line in head.split(b"\r\n"):
-        if line.lower().startswith(b"content-length:"):
+        low = line.lower()
+        if low.startswith(b"content-length:"):
             try:
-                length = int(line.split(b":", 1)[1].strip() or b"0")
+                declared = int(line.split(b":", 1)[1].strip() or b"0")
             except ValueError:
-                length = None
-            break
-    if length is None or length < 0:
-        return head, body
-    if length > READ_LIMIT:
-        length = READ_LIMIT
-    body = bytearray(body)
-    while len(body) < length:
+                declared = 0
+        elif low.startswith(b"transfer-encoding:") and b"chunked" in low:
+            te_chunked = True
+    if declared < 0:
+        declared = 0
+
+    # Profile P1: chunked without Content-Length
+    if declared == 0 and te_chunked:
+        meta["chunked_no_cl"] = True
+        pending = bytearray(body)
+        buf = bytearray()
+        drained = 0
+        drain_capped = False
+        incomplete = False
+        t0 = _time.time()
         try:
-            chunk = conn.recv(min(256, length - len(body)))
+            conn.settimeout(0.35)
+        except Exception:
+            pass
+
+        def _pull(n):
+            nonlocal pending, incomplete
+            while len(pending) < n:
+                if (_time.time() - t0) >= chunked_idle_timeout:
+                    incomplete = True
+                    return False
+                try:
+                    chunk = conn.recv(min(4096, max(1, n - len(pending))))
+                except (socket.timeout, OSError):
+                    incomplete = True
+                    return False
+                if not chunk:
+                    incomplete = True
+                    return False
+                pending.extend(chunk)
+            return True
+
+        while len(buf) < body_cap:
+            while b"\r\n" not in pending:
+                if not _pull(len(pending) + 1):
+                    break
+            if b"\r\n" not in pending:
+                break
+            line, pending = pending.split(b"\r\n", 1)
+            line = line.strip()
+            if b";" in line:
+                line = line.split(b";", 1)[0]
+            try:
+                size = int(line or b"0", 16)
+            except ValueError:
+                incomplete = True
+                break
+            if size == 0:
+                _pull(2)
+                if pending.startswith(b"\r\n"):
+                    pending = pending[2:]
+                break
+            need = size + 2
+            if not _pull(need):
+                take = bytes(pending)
+                pending.clear()
+                room = max(0, body_cap - len(buf))
+                buf.extend(take[:room])
+                drained += max(0, len(take) - room)
+                break
+            chunk_data = bytes(pending[:size])
+            pending = pending[need:]
+            room = max(0, body_cap - len(buf))
+            buf.extend(chunk_data[:room])
+            drained += max(0, len(chunk_data) - room)
+            if drained >= drain_byte_cap or (_time.time() - t0) >= drain_time_cap:
+                drain_capped = True
+                break
+        if incomplete:
+            meta["worker_hold"] = True
+            meta["worker_hold_reason"] = "chunked_idle_timeout"
+        return head, bytes(buf[:body_cap]), 0, drained, drain_capped, meta
+
+    if declared == 0:
+        return head, bytes(body[:body_cap]), 0, 0, False, meta
+    want = min(declared, body_cap)
+    body = bytearray(body)
+    try:
+        conn.settimeout(0.35)
+    except Exception:
+        pass
+    incomplete = False
+    while len(body) < want:
+        try:
+            chunk = conn.recv(min(4096, want - len(body)))
         except (socket.timeout, OSError):
+            incomplete = True
             break
         if not chunk:
+            incomplete = True
             break
         body.extend(chunk)
-    return head, bytes(body[:length])
+    prefix = bytes(body[:body_cap])
+    drained = 0
+    drain_capped = False
+    remaining = max(0, declared - len(prefix))
+    if remaining > 0:
+        t0 = _time.time()
+        try:
+            conn.settimeout(0.25)
+        except Exception:
+            pass
+        to_drain = min(remaining, drain_byte_cap)
+        while drained < to_drain:
+            if (_time.time() - t0) >= drain_time_cap:
+                drain_capped = True
+                incomplete = True
+                break
+            try:
+                chunk = conn.recv(min(65536, to_drain - drained))
+            except (socket.timeout, OSError):
+                drain_capped = True
+                incomplete = True
+                break
+            if not chunk:
+                incomplete = True
+                break
+            drained += len(chunk)
+        if remaining > drain_byte_cap:
+            drain_capped = True
+    if incomplete and (declared > len(prefix) + drained):
+        meta["worker_hold"] = True
+        meta["worker_hold_reason"] = "post_idle_timeout"
+    return head, prefix, declared, drained, drain_capped, meta
+
 
 
 def _client_looks_like_http(conn):
@@ -2003,7 +2591,7 @@ def _status_json(world, ports):
         "hostname": world["hostname"],
         "fqdn": world.get("fqdn"),
         "company": world.get("company"),
-        "model": world.get("nas_model") or "DS220+",
+        "model": world.get("nas_model") or "DS420j",
         "firmware": world.get("nas_firmware") or "5.0.1.2376",
         "ip": world.get("internal_ip") or "10.0.0.21",
         "uptime_days": uptime_days,
@@ -2119,7 +2707,20 @@ def _fake_env(world):
 
 
 
-def _http_response(code, ctype, payload, head_only=False, extra=""):
+_SERVER_FULL = phpapp.APACHE_SERVER  # Sunday cover: Apache/PHP on Ubuntu EC2
+_SERVER_NGINX_LEGACY = "nginx/1.18.0 (Ubuntu)"  # kept for optional DSM mode
+
+
+def _plain_server_payload(payload):
+    """server_tokens off: nginx error bodies say just 'nginx'."""
+    if isinstance(payload, (bytes, bytearray)):
+        return bytes(payload).replace(
+            b"<center>nginx/1.18.0 (Ubuntu)</center>", b"<center>nginx</center>")
+    return payload
+
+
+def _http_response(code, ctype, payload, head_only=False, extra="",
+                   server=_SERVER_FULL):
     statuses = {
         200: "200 OK", 204: "204 No Content", 302: "302 Found",
         400: "400 Bad Request", 401: "401 Unauthorized", 403: "403 Forbidden",
@@ -2136,18 +2737,22 @@ def _http_response(code, ctype, payload, head_only=False, extra=""):
                "Content-Type: %s\r\n"
                "Content-Length: %d\r\n"
                "Connection: close\r\n"
-               "%s\r\n" % (status, bait.HTTP_SERVER, date, ctype, len(payload), extra))
+               "%s\r\n" % (status, server, date, ctype, len(payload), extra))
     if head_only:
         return headers.encode("ascii", "replace")
     return headers.encode("ascii", "replace") + payload
+
+
+def _apache_error(code, reason):
+    return phpapp.apache_error(code, reason)
 
 
 def _nginx_error(code, reason):
     body = (
         "<html>\r\n<head><title>%d %s</title></head>\r\n"
         "<body>\r\n<center><h1>%d %s</h1></center>\r\n"
-        "<hr><center>%s</center>\r\n"
-        "</body>\r\n</html>\r\n" % (code, reason, code, reason, bait.HTTP_SERVER)
+        "<hr><center>nginx/1.18.0 (Ubuntu)</center>\r\n"
+        "</body>\r\n</html>\r\n" % (code, reason, code, reason)
     )
     return body.encode("ascii")
 
@@ -2175,9 +2780,9 @@ def _tag_http_exploit(session, path, body):
 
 def _login_page(world, failed=False):
     company = world.get("company") or "Example Clinic"
-    model = world.get("nas_model") or "DS220+"
+    model = world.get("nas_model") or "DS420j"
     firmware = world.get("nas_firmware") or "5.0.1.2376"
-    host = world.get("hostname") or "files01"
+    host = world.get("hostname") or "srv-files"
     brand = "%s NAS" % (company.split()[0] if company else "File")
     error = ""
     if failed:
@@ -2237,8 +2842,8 @@ def _guestbook_form(signed=False):
 
 def _dashboard_page(world, guestbook_form=False, signed=False):
     company = world.get("company") or "Example Clinic"
-    host = world.get("hostname") or "files01"
-    model = world.get("nas_model") or "DS220+"
+    host = world.get("hostname") or "srv-files"
+    model = world.get("nas_model") or "DS420j"
     firmware = world.get("nas_firmware") or "5.0.1.2376"
     shares = world.get("shares") or {}
     sections = []

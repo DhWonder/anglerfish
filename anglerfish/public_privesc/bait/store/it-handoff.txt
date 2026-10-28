@@ -1,0 +1,10 @@
+Example Clinic — IT handoff (internal)
+
+Staff portal staging — use backup account for overnight restores only.
+
+backup user: lfield-backup
+backup pass: BackupRotate.example
+home hint: ~backup/.ssh/ and /var/www/html/staff/.deploy_id
+
+Do not share outside IT. After rotate, revoke mjones staging.
+Term access: /staff/admin/term.php (backup creds)

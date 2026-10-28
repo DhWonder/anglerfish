@@ -7,28 +7,31 @@ you far more: what they go for first, what tools they use, what they try to
 steal, and, through the tokens planted in that content, where they turn up
 next.
 
-This builds one coherent machine: a small organisation's internal file-share
-and deploy host. The identity (company, hostname, domain, NAS model, banners,
-bait names) comes from the operator's persona file (config/persona.yaml); the
-built-in default is the public, fictional "Example Clinic" on example.net and
-must not be exposed to the internet. Every company-flavoured string (bucket,
-image, SSID, vault key) is derived from that one identity so two names never
-share a box. Same hostname, banners, NAS title, process list, mail, and configs
-everywhere. The web File Station and the fake shell read the same lived-in tree.
+This builds one coherent machine: a small clinic's internal file-share and
+deploy host by default (Example Clinic on example.net), or whichever persona
+the install minted.
+Every company-flavoured string (bucket, image, SSID, vault key, deploy
+password) is derived from that one identity so two names never share a box. Same hostname, banners, NAS title, process list, mail,
+and configs everywhere. The web File Station and the fake shell read the same
+lived-in tree.
 
 Planted logins are split across bait the way a careless admin would leave them
-— never all in one file:
+— never all three in one file:
 
-  - planted_logins[0] (deploy-style)  →  docker-compose under the NAS web root
-  - planted_logins[1] (admin-style)   →  a mail draft in admin's mailbox
-  - admin / <canary>                  →  the IT handover note only
+  - deploy / <Brand>Deploy!     →  docker-compose under the web root
+  - admin  / ChangeMeNow24     →  a mail draft in admin's mailbox
+  - admin  / <canary>          →  the IT handover note only
 
-Planted passwords are minted at random per install (persona.py); the repo
-contains none. Every other secret is either a canary token from tokens.py or
-derived from the per-install seed, so no two installs share a bait string.
+Every other secret is a canary token from tokens.py. None of it is real.
+Public-tree example passwords are placeholders — set your own at install.
 """
 
 import base64
+import zlib
+import struct
+import random
+import hmac
+import hashlib
 import codecs
 import os
 import re
@@ -37,28 +40,21 @@ from urllib.parse import quote
 
 from . import tokens
 
-import hashlib
-import hmac
-import random
-import struct
-import zlib
-
 # One identity, used by banners, web title, shell, mail, and configs.
-# Defaults are the public EXAMPLE persona; real installs override them from
-# the operator's persona file via apply_persona().
 HOSTNAME = "files01"
 COMPANY = "Example Clinic"
 DOMAIN = "example.net"
 FQDN = "%s.%s" % (HOSTNAME, DOMAIN)
-NAS_MODEL = "DS220+"
-NAS_FIRMWARE = "7.2.1-69057"
+NAS_MODEL = "DS420j"
+NAS_FIRMWARE = "5.0.1.2376"
 INTERNAL_IP = "10.0.0.21"
-# Region the bait claims the box lives in. Should match where it is deployed.
+# Region the bait claims the box lives in. Must match where it is deployed
+# (the public IP geolocates to AWS us-east-1).
 AWS_REGION = "us-east-1"
-STAFF = "Sam"
-# Service banners (generic, widely-deployed versions; configurable).
+
+# Sunday cover: Ubuntu EC2 LAMP host (not Synology NAS).
 SSH_BANNER = "SSH-2.0-OpenSSH_8.9p1 Ubuntu-3ubuntu0.6"
-HTTP_SERVER = "nginx/1.18.0 (Ubuntu)"
+HTTP_SERVER = "Apache/2.4.58 (Ubuntu)"
 FTP_BANNER = "220 {fqdn} FTP server (vsftpd 3.0.5) ready."
 SMTP_BANNER = "220 {fqdn} ESMTP Postfix (Ubuntu)"
 LURE_PATH = "/finance/{year}/payroll-master.xlsx"
@@ -67,28 +63,12 @@ DEFAULT_CREDS_IMG = "domainadmin-creds-backup.png"
 VAULT_IMG = DEFAULT_VAULT_IMG
 CREDS_IMG = DEFAULT_CREDS_IMG
 ASSETS_DIR = ""
-# Per-install seed for derived bait strings (process-random without a persona).
 SEED = os.urandom(16).hex()
-
-
-def _derived(label, length=16, alphabet="0123456789abcdef"):
-    """Deterministic per-install filler secret (not a canary, just not shared)."""
-    out = []
-    counter = 0
-    while len(out) < length:
-        digest = hmac.new(SEED.encode(), ("%s:%d" % (label, counter)).encode(),
-                          hashlib.sha256).digest()
-        out.extend(alphabet[b % len(alphabet)] for b in digest)
-        counter += 1
-    return "".join(out[:length])
-
-
-def _rng(label):
-    return random.Random("%s:%s" % (SEED, label))
+PHP_VERSION = "8.4.26"
 
 
 def _brand(company=None):
-    """First word of the company name: 'Example Clinic' -> 'Example'."""
+    """First word of the company name: 'Larkfield Health' -> 'Larkfield'."""
     words = (company or COMPANY or "Files").split()
     return re.sub(r"[^A-Za-z0-9]", "", words[0]) or "Files"
 
@@ -103,6 +83,25 @@ def _initials(company=None):
     return ("".join(w[0] for w in words[:2]) or "F").capitalize()
 
 
+def _deploy_password(company=None):
+    """Careless-admin leet of the brand: 'Larkfield' -> 'Larkf1eldDeploy!'.
+
+    Targeted (company-themed), not in generic brute wordlists.
+    """
+    brand = _brand(company)
+    out = brand
+    for a, b in (("o", "0"), ("i", "1")):
+        if a in out[1:]:
+            idx = out.index(a, 1)
+            out = out[:idx] + b + out[idx + 1:]
+            break
+    if out == brand:  # no o/i to swap: e.g. 'Peregrine' still gets one, 'Hallmark' -> 'H4llmark'
+        idx = out.find("a", 1)
+        if idx > 0:
+            out = out[:idx] + "4" + out[idx + 1:]
+    return out + "Deploy!"
+
+
 def backup_bucket(domain=None):
     return "%s-nas-backups" % _domain_label(domain)
 
@@ -112,19 +111,17 @@ def vault_key(company=None):
 
 # Post-auth only. Never put this on MOTD, login pages, or public /api.
 # Plaintext form is for tests/docs; bait files carry obfuscated encodings of it.
-# Resolves to a dead internal-looking file-server link; the real "gotcha" is
-# the download being logged, not where it points.
-LURE_URL = "https://files.%s%s" % (DOMAIN, LURE_PATH.replace("{year}", time.strftime("%Y")))
-
-
-def _mint_default_logins():
-    from .persona import mint_password
-    return (("deploy", mint_password(_brand(COMPANY))), ("admin", mint_password()))
-
+# Resolves to a dead internal-looking file-server link (the .example TLD never
+# routes anywhere); the real "gotcha" is the download being logged, not where it
+# points. Looks like juicy loot, so it gets chased.
+LURE_URL = "https://files.example.net/finance/2026/payroll-master.xlsx"
 
 # The only logins that open the fake shell / NAS (plus the canary from bait).
-# Minted at random: per process here, per install (persisted) with a persona.
-PLANTED_LOGINS = _mint_default_logins()
+# Documented in the README. Do not reuse these on anything real.
+PLANTED_LOGINS = (
+    ("deploy", _deploy_password()),
+    ("admin", "ChangeMeNow24"),
+)
 
 # Where each planted password lives in the bait tree (for docs and tests).
 PLANT_LOCATIONS = {
@@ -139,35 +136,40 @@ def planted_password_map():
     return dict(PLANTED_LOGINS)
 
 
-_IDENTITY_KEYS = {
-    "HOSTNAME": "hostname", "COMPANY": "company", "DOMAIN": "domain",
-    "NAS_MODEL": "nas_model", "NAS_FIRMWARE": "nas_firmware",
-    "INTERNAL_IP": "internal_ip", "AWS_REGION": "aws_region", "STAFF": "staff_name",
-    "SSH_BANNER": "ssh_banner", "HTTP_SERVER": "http_server",
-    "FTP_BANNER": "ftp_banner", "SMTP_BANNER": "smtp_banner",
-    "LURE_PATH": "lure_path", "VAULT_IMG": "vault_image",
-    "CREDS_IMG": "creds_image", "ASSETS_DIR": "assets_dir",
-}
 # Frozen at import so apply_persona can restore after a persona-driven build.
-_DEFAULTS = dict((k, globals()[k]) for k in _IDENTITY_KEYS)
-_DEFAULTS.update({"PLANTED_LOGINS": PLANTED_LOGINS, "SEED": SEED})
+_DEFAULTS = {
+    "HOSTNAME": HOSTNAME, "COMPANY": COMPANY, "DOMAIN": DOMAIN, "FQDN": FQDN,
+    "NAS_MODEL": NAS_MODEL, "NAS_FIRMWARE": NAS_FIRMWARE, "INTERNAL_IP": INTERNAL_IP,
+    "LURE_URL": LURE_URL, "PLANTED_LOGINS": PLANTED_LOGINS,
+}
 
 
 def apply_persona(persona):
     """Override the module-level identity from a persona dict, or restore defaults."""
-    g = globals()
-    persona = persona or {}
-    for name, key in _IDENTITY_KEYS.items():
-        g[name] = persona.get(key) or _DEFAULTS[name]
-    g["FQDN"] = persona.get("fqdn") or ("%s.%s" % (g["HOSTNAME"], g["DOMAIN"]))
-    g["LURE_URL"] = "https://files.%s%s" % (
-        g["DOMAIN"], g["LURE_PATH"].replace("{year}", time.strftime("%Y")))
-    g["SEED"] = persona.get("canary_seed") or _DEFAULTS["SEED"]
-    logins = persona.get("planted_logins")
-    if logins and len(logins) >= 2:
-        g["PLANTED_LOGINS"] = tuple((str(u), str(p)) for u, p in logins)
-    else:
-        g["PLANTED_LOGINS"] = _DEFAULTS["PLANTED_LOGINS"]
+    global HOSTNAME, COMPANY, DOMAIN, FQDN, NAS_MODEL, NAS_FIRMWARE, INTERNAL_IP, LURE_URL
+    global PLANTED_LOGINS
+    if not persona:
+        HOSTNAME = _DEFAULTS["HOSTNAME"]
+        COMPANY = _DEFAULTS["COMPANY"]
+        DOMAIN = _DEFAULTS["DOMAIN"]
+        FQDN = _DEFAULTS["FQDN"]
+        NAS_MODEL = _DEFAULTS["NAS_MODEL"]
+        NAS_FIRMWARE = _DEFAULTS["NAS_FIRMWARE"]
+        INTERNAL_IP = _DEFAULTS["INTERNAL_IP"]
+        LURE_URL = _DEFAULTS["LURE_URL"]
+        PLANTED_LOGINS = _DEFAULTS["PLANTED_LOGINS"]
+        return
+    HOSTNAME = persona.get("hostname") or _DEFAULTS["HOSTNAME"]
+    COMPANY = persona.get("company") or _DEFAULTS["COMPANY"]
+    DOMAIN = persona.get("domain") or _DEFAULTS["DOMAIN"]
+    FQDN = persona.get("fqdn") or ("%s.%s" % (HOSTNAME, DOMAIN))
+    NAS_MODEL = persona.get("nas_model") or _DEFAULTS["NAS_MODEL"]
+    NAS_FIRMWARE = persona.get("nas_firmware") or _DEFAULTS["NAS_FIRMWARE"]
+    INTERNAL_IP = persona.get("internal_ip") or _DEFAULTS["INTERNAL_IP"]
+    LURE_URL = "https://files.%s/finance/%s/payroll-master.xlsx" % (
+        DOMAIN, time.strftime("%Y"))
+    # Deploy password follows the persona brand so it never names another company.
+    PLANTED_LOGINS = (("deploy", _deploy_password(COMPANY)), ("admin", "ChangeMeNow24"))
 
 
 def ftp_banner():
@@ -178,22 +180,6 @@ def smtp_banner():
     return SMTP_BANNER.replace("{fqdn}", FQDN)
 
 
-def _rename_images(fs):
-    """Apply configured bait image names to paths and text that mention them."""
-    pairs = [(DEFAULT_VAULT_IMG, VAULT_IMG), (DEFAULT_CREDS_IMG, CREDS_IMG)]
-    pairs = [(a[:-4], b[:-4] if b.endswith(".png") else b) for a, b in pairs if a != b]
-    if not pairs:
-        return fs
-    out = {}
-    for path, content in fs.items():
-        for old, new in pairs:
-            path = path.replace(old, new)
-            if isinstance(content, str):
-                content = content.replace(old, new)
-        out[path] = content
-    return out
-
-
 def build(console_host="", sensor_name="", persona=None, classroom=False):
     """Assemble a full fake machine, and the list of tokens planted in it.
 
@@ -202,7 +188,7 @@ def build(console_host="", sensor_name="", persona=None, classroom=False):
     to recognise a trigger later.
 
     persona: optional dict from persona.load_or_create(); when omitted the
-    built-in public example persona is used (tests / classroom demos only).
+    built-in Example Clinic defaults stay (for tests / classroom demos).
     classroom: when True, leave the playful GOTCHA prompts in bait comments;
     when False (default for production), scrub them.
     """
@@ -258,6 +244,14 @@ def build(console_host="", sensor_name="", persona=None, classroom=False):
 
     # --- app + NAS web root (the hosted service) --------------------------
     fs["/var/www/app/.env"] = _env_file(aws, db)
+    fs["/var/www/html/wp-config.php"] = (
+        "<?php\n// clinic wordpress — staging leftover\n"
+        "define('DB_NAME', 'wordpress_clinic');\n"
+        "define('DB_USER', 'wp_clinic');\n"
+        "define('DB_PASSWORD', 'WP_Cl1nic_Staging!');\n"
+        "define('DB_HOST', '127.0.0.1');\n"
+    )
+    fs["/var/www/html/.env"] = fs["/var/www/app/.env"]
     fs["/var/www/app/config/database.yml"] = _database_yml(db)
     fs["/var/www/app/README.md"] = _app_readme()
 
@@ -294,7 +288,7 @@ def build(console_host="", sensor_name="", persona=None, classroom=False):
         "Local mirrors live under /srv/shares/.\n" % COMPANY
     )
 
-    # --- admin home (mail draft plants the fixed admin password) ---------------------
+    # --- admin home (mail draft plants ChangeMeNow24) ---------------------
     fs["/home/admin/.bashrc"] = _bashrc()
     fs["/home/admin/.profile"] = "# ~/.profile\n. ~/.bashrc\n"
     fs["/home/admin/Mail/Drafts/re-nas-access.txt"] = _mail_draft_admin(
@@ -329,7 +323,6 @@ def build(console_host="", sensor_name="", persona=None, classroom=False):
     fs["/root/.bash_history"] = _root_history()
     fs["/root/.mysql_history"] = _mysql_history()
 
-    fs = _rename_images(fs)
     directories = _directories_for(fs)
     shares = _share_index(fs)
 
@@ -574,21 +567,18 @@ def _env_file(aws, db):
     return (
         "# %s production. do not commit.\n"
         "APP_ENV=production\n"
-        "APP_KEY=base64:%s=\n"
+        "APP_KEY=base64:9Qm2sVwq1hR8nZpKcYxA7bLdEfGhJkMn0pQrStUvWxY=\n"
         "DB_CONNECTION=pgsql\n"
         "DATABASE_URL=%s\n"
         "AWS_ACCESS_KEY_ID=%s\n"
         "AWS_SECRET_ACCESS_KEY=%s\n"
         "AWS_DEFAULT_REGION=%s\n"
         "MAIL_HOST=smtp.mailgun.org\n"
-        "MAIL_PASSWORD=%s\n"
+        "MAIL_PASSWORD=8f2c1d9a4b7e6058\n"
         "NAS_URL=http://%s/\n"
-        % (COMPANY, _derived("app_key", 43, _B64), db["value"], aws["value"]["access_key_id"],
-           aws["value"]["secret_access_key"], AWS_REGION, _derived("mail_password", 16), FQDN)
+        % (COMPANY, db["value"], aws["value"]["access_key_id"],
+           aws["value"]["secret_access_key"], AWS_REGION, FQDN)
     )
-
-
-_B64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
 
 
 def _database_yml(db):
@@ -644,14 +634,14 @@ def _docker_compose(deploy_user, deploy_pass):
         "    volumes:\n"
         "      - /srv/shares/Customers:/data/exports:ro\n"
         "  # host maintenance login used by the deploy user over SSH\n"
-        "  # (compose does not use these; %s left them here so the night\n"
+        "  # (compose does not use these; Sam left them here so the night\n"
         "  #  crew can find the box password without paging him)\n"
         "  # HOST_SSH_USER=%s\n"
         "  # HOST_SSH_PASSWORD=%s\n"
         "  redis:\n"
         "    image: redis:7-alpine\n"
         "    restart: unless-stopped\n"
-        % (COMPANY, HOSTNAME, _domain_label(), STAFF, deploy_user, deploy_pass)
+        % (COMPANY, HOSTNAME, _domain_label(), deploy_user, deploy_pass)
     )
 
 
@@ -755,7 +745,7 @@ def _handover_note(admin_pass, portal, deploy_user):
         "          root login is by key only.\n"
         "Portal:   %s\n"
         "          login admin / %s\n"
-        "NAS UI:   http://%s/  — use the admin account %s mailed you\n"
+        "NAS UI:   http://%s/  — use the admin account Sam mailed you\n"
         "          (see his draft in /home/admin/Mail/Drafts/ if you\n"
         "          still have local mail on this box).\n\n"
         "Shares:   /srv/shares/{IT,Customers,Deploy,Office}\n"
@@ -764,10 +754,24 @@ def _handover_note(admin_pass, portal, deploy_user):
         "Backups go to the %s S3 bucket every night.\n"
         "Old VPN profile is under Office share / home/deploy.\n"
         % (HOSTNAME, FQDN, AWS_REGION, deploy_user, portal["value"], admin_pass["value"], FQDN,
-           STAFF, backup_bucket())
+           backup_bucket())
     )
 
 
+
+def _derived(label, length=16, alphabet="0123456789abcdef"):
+    """Deterministic per-install filler secret (not a canary, just not shared)."""
+    out = []
+    counter = 0
+    while len(out) < length:
+        digest = hmac.new(SEED.encode(), ("%s:%d" % (label, counter)).encode(),
+                          hashlib.sha256).digest()
+        out.extend(alphabet[b % len(alphabet)] for b in digest)
+        counter += 1
+    return "".join(out[:length])
+
+def _rng(label):
+    return random.Random("%s:%s" % (SEED, label))
 
 def _asset_bytes(name):
     """Post-auth bait image: operator-supplied, else generated per install.
@@ -784,11 +788,9 @@ def _asset_bytes(name):
                 return fh.read()
     return _generated_png(name)
 
-
 def _png_chunk(tag, data):
     raw = tag + data
     return struct.pack(">I", len(data)) + raw + struct.pack(">I", zlib.crc32(raw) & 0xffffffff)
-
 
 def _generated_png(label, width=640, height=400):
     rng = _rng("img:" + label)
@@ -811,7 +813,6 @@ def _generated_png(label, width=640, height=400):
     ihdr = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
     return b"\x89PNG\r\n\x1a\n" + _png_chunk(b"IHDR", ihdr) + _png_chunk(b"IDAT", raw) + _png_chunk(b"IEND", b"")
 
-
 def _url_b64():
     return base64.b64encode(LURE_URL.encode("ascii")).decode("ascii")
 
@@ -829,9 +830,10 @@ def _url_quoted():
 
 
 def _vault_blob_lines():
-    # Looks like an openssl Salted__ dump; content is per-install filler.
-    salt = _derived("vault_salt", 16, "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/")
-    seed = "U2FsdGVkX1" + salt + _brand().lower() + "VaultChunk" + _derived("vault_body", 80)
+    seed = (
+        "U2FsdGVkX1+9mK3nQpL7wR2vYc8dHf6jB0aEsT4uIxNzWgKmPoLqRsTuVwXyZaBc"
+        "DeFgHiJkLmNoPqRsTuVwXyZ0123456789ABCDEF+/" + _brand().lower() + "VaultChunk"
+    )
     return ["%s%02d==" % ((seed + str(i) * 8)[:76], i) for i in range(1, 12)]
 
 
@@ -948,21 +950,21 @@ def _obfuscated_plants(vault_png_bytes, creds_png_bytes):
 
 
 def _todo_note():
-    return ((
+    return (
         "- rotate guest wifi Monday\n"
-        "- remind %s to remove HOST_SSH_PASSWORD from compose\n"
+        "- remind Sam to remove HOST_SSH_PASSWORD from compose\n"
         "- export customers before month-end\n"
         "- check /api/status after nginx upgrades\n"
         "- finish vault-staging.b64 handoff (notes/) before leave — do not email\n"
         "- verify crumbs: verify.b64.txt / verify.rot13 / session-verify.frag.*\n"
         "- domainadmin-creds-backup.png — move that creds screenshot off the NAS before leave (+ domainadmin-creds-backup.recovery.txt)\n"
-    ) % STAFF)
+    )
 
 
 def _mail_draft_admin(admin_user, admin_pass):
-    """Plant the fixed admin password here — not next to the deploy password."""
+    """Plant admin / ChangeMeNow24 here — not next to the deploy password."""
     return (
-        "From: %s@%s\n"
+        "From: sam@%s\n"
         "To: it-handover@%s\n"
         "Subject: Re: NAS access for the new box\n"
         "Date: %s\n"
@@ -974,9 +976,9 @@ def _mail_draft_admin(admin_user, admin_pass):
         "Change it when you first sign in. I did not put this in the shared\n"
         "IT folder on purpose. Deploy/SSH is separate; ask whoever has the\n"
         "compose file on the box.\n\n"
-        "%s\n"
-        % (STAFF.lower(), DOMAIN, DOMAIN, time.strftime("%a, %d %b %Y %H:%M:%S +0000"),
-           FQDN, admin_user, admin_pass, STAFF)
+        "Sam\n"
+        % (DOMAIN, DOMAIN, time.strftime("%a, %d %b %Y %H:%M:%S +0000"),
+           FQDN, admin_user, admin_pass)
     )
 
 
@@ -1010,11 +1012,11 @@ def _runbook():
 def _customers_csv():
     first = [
         "id,company,contact,email,phone,plan,mrr",
-        "1,Harbourside Cafe,J. Mercer,accounts@harbourside.cafe,+1 555 010 0142,standard,290",
-        "2,Delacroix Dental,S. Delacroix,admin@delacroixdental.co.uk,+1 555 010 0287,priority,490",
-        "3,Peak Fitness,R. Owens,billing@peakfitness.gym,+1 555 010 0331,essentials,140",
-        "4,Ravel Interiors,M. Ravel,hello@ravelinteriors.co.uk,+1 555 010 0419,standard,290",
-        "5,Kestrel Legal,A. Kestrel,finance@kestrellegal.co.uk,+1 555 010 0558,priority,490",
+        "1,Harbourside Cafe,J. Mercer,accounts@harbourside.cafe,+44 118 900 0142,standard,290",
+        "2,Delacroix Dental,S. Delacroix,admin@delacroixdental.co.uk,+44 118 900 0287,priority,490",
+        "3,Peak Fitness,R. Owens,billing@peakfitness.gym,+44 118 900 0331,essentials,140",
+        "4,Ravel Interiors,M. Ravel,hello@ravelinteriors.co.uk,+44 118 900 0419,standard,290",
+        "5,Kestrel Legal,A. Kestrel,finance@kestrellegal.co.uk,+44 118 900 0558,priority,490",
     ]
     # Pad to a believable export size without inventing thousands of named people.
     names = ["Ashford","Bellamy","Cortez","Dunne","Ellis","Frost","Grant","Huang",
@@ -1027,7 +1029,7 @@ def _customers_csv():
         nm = names[(i * 3) % len(names)]
         city = cities[i % len(cities)]
         plan, mrr = plans[i % len(plans)]
-        rows.append("%d,%s %s,%s. %s,accounts@%s-%s.co.uk,+1 555 010 %04d,%s,%d"
+        rows.append("%d,%s %s,%s. %s,accounts@%s-%s.co.uk,+44 118 900 %04d,%s,%d"
                     % (i, nm, city, nm[0], nm, nm.lower(), city.lower(), 1000 + i * 7, plan, mrr))
     rows.append("# exported %s — %d rows" % (time.strftime("%Y-%m-%d"), len(rows) - 1))
     return "\n".join(rows) + "\n"
@@ -1046,11 +1048,8 @@ def _vpn_profile(vpn_pass):
 
 
 def _authorized_keys():
-    # Fake ed25519 public key (32-byte payload, base64). Not a real key.
-    payload = bytes(int(_derived("sshkey", 64, "0123456789abcdef")[i:i+2], 16)
-                    for i in range(0, 64, 2))
-    body = base64.b64encode(b"\x00\x00\x00\x0bssh-ed25519\x00\x00\x00 " + payload).decode("ascii")
-    return "ssh-ed25519 %s deploy@%s\n" % (body, HOSTNAME)
+    return ("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIK9Xr2tPqL3mN8vBcZfWqYhJ0dRsTuVwXyZ "
+            "deploy@%s\n" % HOSTNAME)
 
 
 def _root_history():

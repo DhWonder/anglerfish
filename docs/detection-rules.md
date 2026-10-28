@@ -20,7 +20,7 @@ Metric filters are free; two roll-up custom metrics (`AnglerfishCritical`,
 ### R1 — Planted / canary credential accepted (`auth_ok`)
 - **Severity:** CRITICAL
 - **Trigger:** `event == "auth" AND auth_ok == true`
-- **Why:** With the rework, the fake NAS *grants a sandboxed File Station session* on planted/canary creds. `auth_ok=true` means the adversary got a real (contained) session — still fabricated bait, never a path to real data — and is the first half of the top-severity "bait taken" signal. Pair with R1b.
+- **Why:** With the rework, the fake NAS *grants a sandboxed clinic/portal session* on planted/canary creds. `auth_ok=true` means the adversary got a real (contained) session — still fabricated bait, never a path to real data — and is the first half of the top-severity "bait taken" signal. Pair with R1b.
 - **CW filter:** `{ $.event = "auth" && $.auth_ok IS TRUE }` → metric `AnglerfishCritical`
 - **Legacy (until Red Team ships v2):** `{ $.auth_ok IS TRUE && $.peer_ip = "*" }` (session-end records)
 - **SIEM:** `event:auth auth_ok:true`
@@ -28,7 +28,7 @@ Metric filters are free; two roll-up custom metrics (`AnglerfishCritical`,
 ### R1b — Bait / canary file taken (`path_read` / gotcha)
 - **Severity:** CRITICAL (top alarm — higher priority than R1 alone)
 - **Trigger:** `(event IN ("read-file","gotcha") AND path_read is set)` OR `(event == "gotcha")` OR (`auth_ok == true` on the same `session_id` as a subsequent `path_read` of bait/fake docs/AWS-key canaries)
-- **Why:** Red Team's rework exposes sandboxed File Station (fake docs / planted AWS keys / bait). A sandboxed login *plus* reading bait is the cleanest "thinking adversary took the honey" signal — distinct from a mere cred-harvest attempt that fails.
+- **Why:** Sandboxed clinic portal + fake shell expose fake docs / planted AWS keys / bait. A sandboxed login *plus* reading bait is the cleanest "thinking adversary took the honey" signal — distinct from a mere cred-harvest attempt that fails.
 - **CW filter (path_read present):** `{ ($.event = "read-file" || $.event = "gotcha") && $.path_read = "*" }` → `AnglerfishCritical`
 - **CW filter (gotcha id):** *omitted in the shipped template* — the sensor emits `read-file` with `path_read`, not a standalone `event=gotcha`. Keep the `path_read` filter; add a gotcha filter only if you enable classroom reveal mode.
 - **SIEM:** correlate `auth_ok:true` → `path_read:*` / `gotcha_id:*` on same `session_id` within 15 minutes; alert as **BAIT_TAKEN**.

@@ -28,3 +28,10 @@ sensor emits `read-file` + `path_read`, which `crit-r1b-bait-taken` matches.
 See `../../scripts/`: `cwagent-rollout.sh`, `host-egress-guard.sh`,
 `restrict-egress.sh`, `update-admin-ip.sh`. Read before running; none are
 invoked by the template automatically.
+
+## Alerts
+
+Default stack wiring uses SNS → email. Prefer a plain, readable
+operator alert (clear subject/body) over cryptic default SNS templates when
+you customise notifications — SES or an SMTP path via `anglerfish/notify.py`
+both work.

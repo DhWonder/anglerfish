@@ -11,9 +11,7 @@ import json
 import os
 import time
 
-from . import bait
-
-# Realistic SYNO.API.Info catalog (subset a real DS220+-class DSM 7.1 returns).
+# Realistic SYNO.API.Info catalog (subset a real DS420j-class DSM 7.1 returns).
 _API_CATALOG = {
     "SYNO.API.Info": {"path": "query.cgi", "minVersion": 1, "maxVersion": 1},
     "SYNO.API.Auth": {"path": "auth.cgi", "minVersion": 1, "maxVersion": 7},
@@ -98,12 +96,12 @@ def system_info(world):
     return {
         "success": True,
         "data": {
-            "model": world.get("nas_model") or "DS220+",
+            "model": world.get("nas_model") or "DS420j",
             "serial": "20A0BQN" + hashlib.md5(
                 (world.get("hostname") or "x").encode()).hexdigest()[:6].upper(),
             "version": world.get("nas_firmware") or "5.0.1.2376",
             "version_string": "DSM " + (world.get("nas_firmware") or "5.0.1.2376"),
-            "hostname": world.get("hostname") or "files01",
+            "hostname": world.get("hostname") or "srv-files",
             "firmware_date": "2023/07/25",
             "firmware_ver": world.get("nas_firmware") or "5.0.1.2376",
             "uptime": int(max(0, time.time() - (world.get("boot_time")
@@ -126,9 +124,10 @@ def login_page_html(world, failed=False, session_id=""):
     # both login surfaces name the one persona the same way ("Example Clinic NAS").
     company = world.get("company") or "Example Clinic"
     brand = "%s NAS" % (company.split()[0] if company else "File")
-    model = world.get("nas_model") or "DS220+"
+    model = world.get("nas_model") or "DS420j"
     firmware = world.get("nas_firmware") or "5.0.1.2376"
-    host = world.get("hostname") or "files01"
+    # Server name as DSM shows it: the persona FQDN, same on every NAS Host.
+    host = (world.get("fqdn") or world.get("hostname") or "srv-files")
     # Small natural variation so responses aren't byte-identical every time.
     nonce = os.urandom(4).hex()
     err = ""
@@ -241,8 +240,8 @@ def nginx_414_html():
     return (
         "<html>\r\n<head><title>414 Request-URI Too Large</title></head>\r\n"
         "<body>\r\n<center><h1>414 Request-URI Too Large</h1></center>\r\n"
-        "<hr><center>%s</center>\r\n"
-        "</body>\r\n</html>\r\n" % bait.HTTP_SERVER
+        "<hr><center>nginx/1.18.0 (Ubuntu)</center>\r\n"
+        "</body>\r\n</html>\r\n"
     )
 
 

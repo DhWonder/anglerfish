@@ -15,9 +15,9 @@ persona strings.
 
 - **Containment.** Winning the honeypot only harvests canaries. IMDSv2 hop=1,
   instance role Deny outside `/anglerfish/*`, bait is sandboxed.
-- **Cover.** Coherent persona + host keys + TLS cert per install; Synology DSM
-  webapi/login SPA; nginx/OpenSSH banners; planted-cred → FileStation →
-  `path_read` bait chain (R1b BAIT_TAKEN).
+- **Cover.** Coherent persona + host keys + TLS cert per install; clinic
+  Apache/PHP cover (DSM optional); OpenSSH banners; public→privesc + PHP2Shell
+  bait chains; planted-cred → sandboxed payoff → `path_read` / gotcha (R1b).
 - **Detection feed.** JA3/JA3S/SNI/ALPN + HASSH + `events.jsonl`; failed-hello
   still fingerprinted; plaintext-on-443 → `tls_fp_path=fallback`. Off-host
   CloudWatch shipping with two roll-up alarms.
@@ -30,8 +30,8 @@ persona strings.
    "nginx without http2" story, but JA3S diversity on TLS1.3 is low.
 3. SSH algorithm/timing profile is thinner than a real OpenSSH for the
    claimed banner (no tarpit / alternate KEX in this release).
-4. DSM surface is webapi + login SPA + sandboxed File Station; deeper
-   FileBrowser behaviour beyond the bait path thins out.
+4. Clinic portal / term depth beyond the designed 3-beat thins out; legacy
+   DSM remains opt-in only.
 5. Some CDN/egress paths drop hostname-SNI before arrival — operator network
    issue, not a honeypot tell, but it means some clients never exercise the
    SNI path you log.

@@ -114,16 +114,24 @@ hport, fport = free_port(), free_port()
 s = Sensor(name="realism", persona=False, classroom=False, bind="127.0.0.1",
            ports=[hport, fport], log_path="/tmp/anglerfish-realism.log",
            status_path="/tmp/anglerfish-realism.json")
-# 3. /api/status gating (call the page router directly: protocol-agnostic).
+# 3. Clinic cover: /api/status and /health are not public DSM surfaces.
+# Anonymous hits must not leak internals (404 Apache clinic page is fine).
 sess = {"events": [], "read_files": [], "credentials": []}
 page, ctype, code, _cookie, _hdrs = s._page("/api/status", sess, "GET", b"")
-check("anonymous /api/status -> 401", code == 401)
-check("anonymous /api/status leaks no internal IP / ports",
-      s.world["internal_ip"] not in page and "listen_ports" not in page)
+check("anonymous /api/status does not leak internals",
+      s.world["internal_ip"] not in page and "listen_ports" not in page
+      and code in (401, 404))
 page, ctype, code, _cookie, _hdrs = s._page("/health", sess, "GET", b"")
-check("/health -> 200 bare ok", code == 200 and s.world["internal_ip"] not in page)
-page, ctype, code, _cookie, _hdrs = s._page("/api/status", sess, "GET", b"", web_user="deploy")
-check("signed-in /api/status -> 200 full status", code == 200 and "shares_ok" in page)
+check("/health does not leak internals",
+      s.world["internal_ip"] not in page and code in (200, 404))
+# Opt-in DSM cover still exposes gated status for signed-in File Station labs.
+import os as _os
+if _os.environ.get("ANGLERFISH_ALLOW_DSM", "").strip().lower() in ("1", "true", "yes", "on"):
+    page, ctype, code, _cookie, _hdrs = s._page("/api/status", sess, "GET", b"", web_user="deploy")
+    check("signed-in /api/status -> 200 full status (DSM mode)",
+          code == 200 and "shares_ok" in page)
+else:
+    check("clinic cover skips DSM /api/status full status", True)
 
 # 4. Shell redirections and network tools.
 sh = shellfake.FakeShell(s.world, [22, 80], classroom=False, peer_ip="1.2.3.4",

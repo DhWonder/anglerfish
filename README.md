@@ -1,8 +1,9 @@
 # Anglerfish
 
-A multi-service deception sensor. It looks like a small organisation's
-internal NAS and deploy host; anyone who digs in finds planted credentials and
-canary files. Taking the bait *is* the detection.
+A multi-service deception sensor. It looks like a small clinic's misconfigured
+Apache/PHP host (plus the usual SSH/FTP/SMTP/telnet facades); anyone who digs
+in finds planted credentials and canary files. Taking the bait *is* the
+detection.
 
 Built by **DhWonder** with red-team and blue-team AI assistants.
 
@@ -14,14 +15,31 @@ Built by **DhWonder** with red-team and blue-team AI assistants.
 | Facade | Looks like |
 |---|---|
 | SSH | OpenSSH 8.9p1 on Ubuntu (real handshake, HASSH fingerprint, fake shell) |
-| HTTPS / HTTP | nginx/1.18 + Synology DSM login SPA + sandboxed File Station |
+| HTTPS / HTTP | Apache/2.4.58 + PHP 8.x clinic site, staff portal, PHP2Shell-shaped upload surface |
 | FTP | vsftpd 3.0.5 |
 | SMTP | Postfix on Ubuntu |
 | Telnet | Busybox-ish banner (Mirai food) |
 
-One coherent persona per install: hostname, company, domain, NAS model,
-banners, planted logins, bait tree. Identity comes from a YAML file **you**
-own; host keys, TLS cert and planted passwords are minted at first run.
+One coherent persona per install: hostname, company, domain, banners, planted
+logins, bait tree. Identity comes from a YAML file **you** own; host keys, TLS
+cert and planted passwords are minted at first run.
+
+Earlier builds used a Synology DSM / File Station cover. The live cover is a
+**clinic site on a misconfigured Apache/PHP host** that fits a public cloud IP
+story; DSM remains available only behind `ANGLERFISH_ALLOW_DSM=1`.
+
+## Live lures (bait only)
+
+| Lure | What an attacker sees |
+|---|---|
+| PHP2Shell chain | Multipart upload surface with FULLCHAIN / FAKE_LEAK / FAKE_PERSIST shapes — payload URLs logged, **never fetched** |
+| Public → privesc (3-beat) | Public leak → weak staff login (`mjones`) → escalate `lfield-backup` on `/staff/admin/term.php` |
+| Recon stubs | Clinic/portal paths that survive mid-recon without bouncing scanners |
+| Gotcha loot | Juicy filenames served with image-magic Content-Type (base64 text for `cat`/`base64`) |
+| Sticky term UI | After escalate, user/pass fields hide; banner shows `escalated as lfield-backup · session sticky` |
+
+**Hard line:** no real RCE, no outbound fetch of attacker payloads, bait only.
+There is no path from the honeypot to anything real.
 
 ## Architecture
 
@@ -29,19 +47,20 @@ own; host keys, TLS cert and planted passwords are minted at first run.
 flowchart LR
   Attacker((Internet)) -->|world-open ports| Sensor[Anglerfish sensor]
   Admin[[Admin /32]] -->|real sshd| Host[EC2 host]
+  Sensor -->|clinic Apache/PHP + SSH/FTP/SMTP/telnet| Facades[Facades]
   Sensor -->|events.jsonl| Agent[CW agent]
   Agent --> Logs["/anglerfish/sessions"]
   Logs --> MF[Metric filters]
   MF --> Crit[AnglerfishCritical]
   MF --> High[AnglerfishHighSignal]
-  Crit --> SNS[SNS email]
-  High --> SNS
+  Crit --> Alert[Alert email]
+  High --> Alert
   Sensor -.->|Deny| Real[(Anything real)]
 ```
 
-**Hard line:** bait may be taken; there is no path to anything real.
-Instance role Deny outside `/anglerfish/*`, IMDSv2 hop limit 1, no real
-credentials on the box.
+Detection still ships CloudWatch Logs + metric filters/alarms. Prefer a plain
+operator alert mail (readable subject/body) over cryptic SNS default templates
+when you wire notifications.
 
 ## Quick start (local)
 
@@ -58,15 +77,26 @@ python3 anglerfish_cli.py sensor \
   --state-dir ~/.anglerfish-dev
 
 # 3. In another terminal
-curl -sk https://127.0.0.1:8443/ | head
-nc -v 127.0.0.1 2222                # SSH banner
+curl -s http://127.0.0.1:8080/ | head          # clinic Apache cover
+nc -v 127.0.0.1 2222                           # SSH banner
 ```
 
-Planted passwords are printed once at first mint (and saved under the state
-dir). They are random; the repo contains none.
+Optional PHP2Shell research shapes (lab only):
 
 ```bash
-python3 -m unittest discover -s tests -v     # or: for t in tests/test_*.py; do python3 $t; done
+export ANGLERFISH_PHP2SHELL_FULLCHAIN=1
+export ANGLERFISH_PHP2SHELL_FAKE_LEAK=1
+export ANGLERFISH_PHP2SHELL_FAKE_PERSIST=1
+```
+
+Planted passwords for File Station / shell logins are printed once at first
+mint (saved under the state dir). The public→privesc example passwords shipped
+in `anglerfish/public_privesc/creds.py` are **placeholders** — change them
+before any network exposure so clones cannot fingerprint a live sensor.
+
+```bash
+python3 -m unittest discover -s tests -v
+# or: for t in tests/test_*.py; do python3 "$t"; done
 ```
 
 ## Detection (Blue Team half)
@@ -76,21 +106,23 @@ agent. Two roll-up metrics keep you inside the always-free tier:
 
 | Metric | Fires on | Default alarm |
 |---|---|---|
-| `AnglerfishCritical` | planted/`auth_ok`, bait `path_read` (R1b), org-themed cred guess | SNS, 5-min, threshold 1 |
-| `AnglerfishHighSignal` | Synology webapi, FTP dialogue past USER/PASS, forged sid/token | SNS, 1h, threshold 5 |
+| `AnglerfishCritical` | planted/`auth_ok`, bait `path_read` / gotcha, org-themed cred guess | alert mail, 5-min, threshold 1 |
+| `AnglerfishHighSignal` | PHP2Shell tags, FTP dialogue past USER/PASS, forged sid/token | alert mail, 1h, threshold 5 |
 
 Full rule table: [`docs/detection-rules.md`](docs/detection-rules.md) (R1–R11).
+Clinic cover notes: [`docs/clinic/OVERVIEW.md`](docs/clinic/OVERVIEW.md).
 
 ## Containment model
 
 | Control | How |
 |---|---|
 | No real secrets on the box | Planted passwords minted per install; canaries are fake AWS keys / URLs |
+| No real RCE / no payload fetch | Upload bodies size-capped and logged; attacker URLs never retrieved |
 | No lateral movement | Sensor UID egress-guarded from IMDS, admin port, VPC (optional script) |
 | No IMDS creds via SSRF | IMDSv2 required, hop limit **1** |
 | No useful IAM | Instance role Deny for SSM/S3 outside `/anglerfish/*` |
 | Admin SSH locked | Non-22 port, `AdminCidr` /32 only; honeypot ports stay world-open |
-| Sandboxed payoff | File Station + fake shell serve bait only; never exec attacker input |
+| Sandboxed payoff | Clinic portal + fake shell serve bait only; never exec attacker input |
 
 ## Cost
 
@@ -99,30 +131,15 @@ Roughly **~$1/mo** on a small EC2 (t3.micro/nano) with CloudWatch Logs
 WAF/CDN — those would hide the TLS/SSH fingerprints the sensor is built to
 collect.
 
-## Results (public deploy, aggregate)
+## Results (first ~33h on a public deploy, aggregate)
 
-As of 22 Oct 2026: about 4.8 days on a public cloud address (18–22 Oct),
-with the operator's own test traffic left out.
-
-- ~**53,000** sessions from ~**2,160** source IPs
-- ~**67%** telnet (Mirai-class sprays), ~**20%** SSH brute force, ~**13%**
-  web (HTTP/HTTPS); a handful of FTP and SMTP
-- ~**52,500** login guesses on telnet/SSH/FTP; none succeeded
-- Web: `.env` / `.git` / cloud-credential and AI-config hunting, WordPress
-  sweeps, Synology-login and ProxyShell-shaped probes, React2Shell
-  (CVE-2025-55182) payloads, a few MCP-server discovery requests
-- ~**280** sources identified themselves as research or indexing scanners
-- No outsider read a bait file or set off a canary; no hands-on, targeted
-  attacker seen so far
-- A few people scanned it with permission; that traffic is not counted above
+- ~**21,000** sessions from ~**320** source IPs
+- ~**96%** telnet (Mirai-class sprays)
+- Web: secrets / AI-config hunting, clinic/PHP- and legacy Synology-shaped probes
 - **Zero** wild compromises of anything real
 
-For comparison, the first ~33h were ~21,000 sessions from ~320 IPs, ~96%
-telnet. Web traffic grew once the sensor had a public hostname.
-
-A self-run red/blue review after the deception rework still lists these
-remaining tells (TLS↔HTTP session join, thin HTTP/2 story, SSH algo
-set, post-login DSM depth). See [`docs/red-blue-evaluation.md`](docs/red-blue-evaluation.md).
+Independent red/blue ratings after the deception rework: **8/10 each**, with
+honest remaining tells. See [`docs/red-blue-evaluation.md`](docs/red-blue-evaluation.md).
 
 ## Operational security
 
@@ -136,23 +153,29 @@ Anglerfish is built so the **public tree and any live sensor diverge**:
 2. **Secrets are minted, not shipped.** Host keys, TLS cert, planted
    passwords and the canary seed are generated on first run under
    `~/.anglerfish/` (or `--state-dir`). Delete that directory to re-mint.
-3. **Bait filenames are configurable.** Default image names in the example
+3. **Public→privesc example passwords are placeholders.** Change
+   `anglerfish/public_privesc/creds.py` (and the matching bait store files)
+   before deploy — do not reuse the example strings on a live sensor.
+4. **Bait filenames are configurable.** Default image names in the example
    persona should be changed; images themselves are generated per install
    unless you point `bait.assets_dir` at your own (also gitignored) files.
-4. **Never commit** `config/persona.yaml`, `*.pem`, `*.key`, state dirs, raw
-   session logs, or CloudWatch exports.
+5. **Never commit** `config/persona.yaml`, `*.pem`, `*.key`, state dirs, raw
+   session logs, CloudWatch exports, or deploy evidence.
 
 ## Layout
 
 ```
-anglerfish/           sensor package (stdlib + optional PyYAML)
-anglerfish_cli.py     sensor / console / report / audit / notify
-config/
-  persona.example.yaml
-deploy/aws/           CloudFormation + CW agent config + helper scripts
-docs/                 detection rules, log schema, threat model, evaluation
+anglerfish/                 sensor package (stdlib + optional PyYAML)
+  phpapp.py                 clinic Apache/PHP cover
+  php2shell_chain.py        PHP2Shell lure state machine (bait only)
+  public_privesc/           3-beat public→privesc lure + sticky term UI
+  vhosts.py                 clinic / portal / billing / mail Host roles
+anglerfish_cli.py           sensor / console / report / audit / notify
+config/persona.example.yaml
+deploy/aws/                 CloudFormation + CW agent config + helpers
+docs/                       detection rules, log schema, threat model, clinic
 tests/
-scripts/              cwagent rollout, egress guard, admin-ip updater
+scripts/                    cwagent rollout, egress guard, admin-ip updater
 ```
 
 ## Deploy (AWS)

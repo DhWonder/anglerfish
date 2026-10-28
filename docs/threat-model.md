@@ -4,8 +4,8 @@
 
 Anglerfish is a **multi-service deception sensor**. It listens on common
 Internet-facing ports (SSH, HTTP/HTTPS, FTP, SMTP, telnet) and answers with
-believable banners and a coherent fake machine (small-business NAS + deploy
-host). Attackers who dig in find planted credentials and canary files; taking
+believable banners and a coherent fake machine (clinic Apache/PHP host +
+multi-service facades). Attackers who dig in find planted credentials and canary files; taking
 them is itself the detection signal.
 
 It is **not** a SIEM, WAF, or IDS. Cheap CloudWatch Logs metric filters and two
@@ -29,7 +29,7 @@ paged when bait is taken — nothing more.
 2. **Opportunistic humans** following a Shodan / Censys hit.
    Should see a coherent persona, a login that works, and bait worth taking.
 3. **Careful humans / red teamers** probing for honeypot tells
-   (thin TLS fingerprint, missing DSM surface, shared host keys across
+   (thin TLS fingerprint, shallow portal depth, shared host keys across
    installs). Persona-per-install and install-time key minting are the main
    counters; some tells remain (see `red-blue-evaluation.md`).
 
@@ -43,8 +43,8 @@ paged when bait is taken — nothing more.
 - No real credentials on the box. Planted passwords are random per install.
 - Host egress guard (optional script) blocks the sensor UID from IMDS,
   admin SSH, and the rest of the VPC.
-- Sandboxed File Station / fake shell never exec attacker input and never
-  touch the real filesystem.
+- Sandboxed clinic portal / fake shell never exec attacker input, never
+  fetch attacker payload URLs, and never touch the real filesystem.
 
 ## Trust boundaries
 
