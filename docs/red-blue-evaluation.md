@@ -54,3 +54,14 @@ persona strings.
 
 Exact attacker IPs, the live persona, and account identifiers are intentionally
 omitted from this public write-up.
+
+
+## Lifetime wild traffic (18 Oct → 5 Nov 2026 · ~18.3 days)
+
+Updated public summary (own / lab / course-peer IPs excluded):
+
+- **162,024** sessions from **10,898** unique IPs across **147** countries
+- ~**114.5k** password guesses; Mirai-class telnet ~**57%** of sessions
+- Hard stops held: **0** auth_ok / shells / commands / file reads — no real RCE,
+  no outbound fetch
+- See the README Results section for the fuller named-campaign breakdown

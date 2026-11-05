@@ -131,12 +131,19 @@ Roughly **~$1/mo** on a small EC2 (t3.micro/nano) with CloudWatch Logs
 WAF/CDN — those would hide the TLS/SSH fingerprints the sensor is built to
 collect.
 
-## Results (first ~33h on a public deploy, aggregate)
+## Results (public deploy, 18 Oct → 5 Nov 2026 · ~18.3 days)
 
-- ~**21,000** sessions from ~**320** source IPs
-- ~**96%** telnet (Mirai-class sprays)
-- Web: secrets / AI-config hunting, clinic/PHP- and legacy Synology-shaped probes
-- **Zero** wild compromises of anything real
+Wild traffic only (own / lab / course-peer IPs excluded):
+
+- **162,024** sessions from **10,898** unique IPs across **147** countries
+- ~**114.5k** password guesses (telnet ~103.2k · SSH ~10.3k · FTP ~0.9k)
+- Mirai-class telnet ~**57%** of sessions; top countries by volume: Brazil, USA, China
+- Named noise besides Mirai: SSH brute force, `.env`/`.git`/`.aws` harvest (Androxgh0st),
+  React2Shell probes, WordPress sprays, PHP2Shell kits, RedTail, Mozi
+- Bait: leaked config `.bak` downloaded **3×**; planted `clinic_app` password reused **8×**
+  (FTP/SSH/Adminer) by one IP — all failed
+- Hard stops held: **0** `auth_ok` · **0** shells · **0** commands · **0** file reads —
+  PHP2Shell kits reached the trigger step and soft-failed; **no real RCE**, **no outbound fetch**
 
 Independent red/blue ratings after the deception rework: **8/10 each**, with
 honest remaining tells. See [`docs/red-blue-evaluation.md`](docs/red-blue-evaluation.md).
