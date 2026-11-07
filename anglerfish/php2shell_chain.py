@@ -27,8 +27,10 @@ import time
 from collections import OrderedDict
 
 # --- config -----------------------------------------------------------------
-# Research profile TTL (Red addendum); was 120s.
-STATE_TTL_SEC = 300
+# Research profile TTL (Red addendum); was 120s, then 300s.
+# 2026-11-07 kit-walls fix: 900s (15 min) so repeat visitors / slow kits that
+# re-run the include loop minutes after their primes still find S1 state.
+STATE_TTL_SEC = 900
 MARKER_MAX = 96
 PROGRESS_NAME_MAX = 64
 S1_DELAY_MS = (100, 400)
@@ -93,6 +95,13 @@ _UPLOAD_ROUTES = frozenset({
     "/index.php",  # Profile P1: kits POST progress to index.php too
 })
 
+# LFI query params. Legacy set always counts (even ?page=about → drop probe).
+_LFI_PARAMS_LEGACY = ("page", "file", "path", "include", "doc", "pg")
+# 2026-11-07 kit-walls fix: extra params used by known kits (orange one-request
+# racer uses ?0=; others f/inc/template/view/lang). Only treated as LFI when
+# the value looks path-like, so benign ?lang=en / ?view=list keep the page.
+_LFI_PARAMS_EXTRA = ("0", "f", "inc", "template", "view", "lang")
+
 _S2_SESS_PATH_RE = re.compile(
     r"^(?:/var/lib/php/sessions|/tmp|/var/lib/php)/sess_([A-Za-z0-9,-]{1,128})$"
 )
@@ -106,6 +115,37 @@ _LEAK_BY_PREFIX = {}  # junk[:N] -> original sid (N in LEAK_PREFIX_LENS)
 LEAK_PREFIX_LENS = (32, 64, 128, 256)
 # Felt-win fake persist/C2 overlay (in-memory only; never real FS/cron/ssh/sockets)
 _PERSIST_OVERLAY = {}  # sess_family -> overlay dict
+
+
+def body_has_upload_progress(p2s=None, body=b""):
+    """True when this request carries PHP_SESSION_UPLOAD_PROGRESS.
+
+    Uses the sensor/phpapp inspect result first, then the capped body prefix
+    (works for partial / idle-timeout bodies: only the first bytes matter).
+    Never parses or executes the value.
+    """
+    p2s = p2s or {}
+    if p2s.get("has_upload_progress"):
+        return True
+    raw = body or b""
+    if isinstance(raw, str):
+        raw = raw.encode("latin-1", "replace")
+    return b"php_session_upload_progress" in bytes(raw[:INSPECT_PREFIX_CAP]).lower()
+
+
+_PLAIN_TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+
+def is_plain_progress_token(progress_name):
+    """Plain alnum progress (e.g. `pwn`) = marker-gated kit, not a B1 leak kit."""
+    return bool(_PLAIN_TOKEN_RE.match((progress_name or "").strip()))
+
+
+def leak_on_plain_token_enabled():
+    """Old behaviour (swap cookie even for plain tokens). Default OFF."""
+    return os.environ.get(
+        "ANGLERFISH_PHP2SHELL_LEAK_PLAIN_TOKEN", "").strip().lower() in (
+        "1", "true", "yes", "on")
 
 
 def fullchain_enabled():
@@ -206,6 +246,18 @@ def maybe_attach_fake_leak(st, cookie, research):
     if not fake_leak_enabled():
         return cookie, research
     st = st or {}
+    # 2026-11-07 kit-walls fix: marker-gated kits (plain progress token like
+    # `pwn`) usually run a cookie-jar HTTP session that honours Set-Cookie. A 8–64KiB
+    # PHPSESSID then blows the sensor's ~10KiB head cap (and Apache's 8190
+    # LimitRequestFieldSize story) on the NEXT prime: Content-Length/Type and
+    # the body are lost and the client can hit EPIPE mid-upload. Skip the swap
+    # for plain tokens; leak still fires for B1-style kits (empty/odd/php-ish
+    # progress values, oversized sids). Opt back in with
+    # ANGLERFISH_PHP2SHELL_LEAK_PLAIN_TOKEN=1.
+    if (is_plain_progress_token(st.get("progress_name") or "")
+            and not leak_on_plain_token_enabled()):
+        research["fake_leak_skipped_plain_token"] = True
+        return cookie, research
     fam = st.get("sess_family") or sess_family(st.get("sessid") or "")
     ck = st.get("campaign_key") or ""
     key = fam or ck
@@ -506,19 +558,21 @@ def _advance_s2_progress(sessid, st):
 
 
 def _should_race_flake(st):
-    """~20–30% of S2 within ~300ms of S1 (or first probe) → 404; retry OK."""
+    """~20–30% of the FIRST S2 probe for a sid → 404; retry OK.
+
+    2026-11-07 kit-walls fix: once a sid has made any S2 attempt (flaked or
+    served) we never flake it again — previously every probe inside the
+    300ms window could re-roll, which starved fast racers. Window kept only
+    as research context.
+    """
     if not st:
         return False
     if os.environ.get("ANGLERFISH_PHP2SHELL_NO_FLAKE", "").strip() in (
             "1", "true", "yes", "on"):
         return False
-    now = time.time()
-    s1_at = float(st.get("s1_at") or 0)
-    first = not st.get("s2_attempted")
-    within = s1_at and (now - s1_at) <= RACE_FLAKE_WINDOW_SEC
-    if first or within:
-        return random.randint(1, 100) <= RACE_FLAKE_PCT
-    return False
+    if st.get("s2_attempted"):
+        return False
+    return random.randint(1, 100) <= RACE_FLAKE_PCT
 
 
 def s1_soft_fail_html(company, progress_name="", sessid=""):
@@ -1345,8 +1399,14 @@ def _s2_sess_path_sid(clean):
     return m.group(1) if m else None
 
 
+def _looks_pathlike(v):
+    low = (v or "").lower()
+    return ("/" in low or "\\" in low or ".." in low or "sess_" in low
+            or "php://" in low or low.startswith(("data:", "expect:", "file:")))
+
+
 def _lfi_param_target(query):
-    """Profile P1: extract ?page= / ?file= value; never opens FS."""
+    """Profile P1: extract ?page= / ?file= / ?0= … value; never opens FS."""
     q = query or ""
     if not q:
         return ""
@@ -1354,15 +1414,28 @@ def _lfi_param_target(query):
         if "=" not in part:
             continue
         k, v = part.split("=", 1)
-        if k.lower() in ("page", "file", "path", "include", "doc", "pg"):
-            v = v.replace("+", " ")
-            try:
-                from urllib.parse import unquote
-                v = unquote(v)
-            except Exception:
-                pass
-            return v.strip()
+        kl = k.lower()
+        if kl not in _LFI_PARAMS_LEGACY and kl not in _LFI_PARAMS_EXTRA:
+            continue
+        v = v.replace("+", " ")
+        try:
+            from urllib.parse import unquote
+            v = unquote(v)
+        except Exception:
+            pass
+        v = v.strip()
+        if kl in _LFI_PARAMS_EXTRA and not _looks_pathlike(v):
+            continue
+        return v
     return ""
+
+
+_PHP_FILTER_B64_RE = re.compile(r"(?i)php://filter/.*convert\.base64-encode")
+
+
+def _is_php_filter_b64(target):
+    """php://filter/convert.base64-encode/resource=…/sess_<sid> include."""
+    return bool(_PHP_FILTER_B64_RE.search(target or ""))
 
 
 def _s4_should_trigger(clean, query, body):
@@ -1581,37 +1654,65 @@ def route(path, method="GET", query="", sessid="", body=b"", p2s=None,
         note_drop_probe(sid, clean)
         research["php2shell_drop_probe"] = clean
 
-    # S1: upload POST with progress indicators
-    if method == "POST" and clean in _UPLOAD_ROUTES:
-        if p2s.get("has_upload_progress") or p2s.get("hit") or (
-                b"PHP_SESSION_UPLOAD_PROGRESS" in (body or b"")):
-            meta = extract_multipart_meta(
-                body or b"", p2s.get("content_type") or "")
-            sample = persist_body_sample(body or b"")
-            st = note_s1(
-                sid,
-                progress_name=p2s.get("progress_name") or "",
-                body_prefix=body or b"",
-                payload_urls=p2s.get("payload_urls"),
-                declared_length=declared,
-                src_ip=src_ip,
-                ua=ua,
-            )
-            if apply_s1_delay:
-                try:
-                    time.sleep(s1_delay_sec())
-                except Exception:
-                    pass
-            # OOM sticky-once when flag on + huge CL + progress
-            if (oom_shape_enabled()
-                    and declared >= OOM_SHAPE_CL
-                    and not st.get("oom_fired")):
-                st = touch_state(sid, oom_fired=True)
-                research.update(research_event_fields(st, p2s, meta, sample))
-                cookie, research = maybe_attach_fake_leak(st, cookie, research)
-                return (php2shell_oom_fatal_html(), "text/html; charset=utf-8",
-                        500, cookie, "oom_fatal_500", "oom_producer_shape",
-                        research)
+    # S1: upload POST with progress indicators.
+    # 2026-11-07 kit-walls fix: progress-anywhere — PHP writes upload progress
+    # for ANY script that receives the multipart field, so kits prime `/`,
+    # /login.php, /test.php … Run S1 on any POST that carries the field (not
+    # just _UPLOAD_ROUTES). Upload routes keep the older looser p2s.hit gate.
+    has_progress = body_has_upload_progress(p2s, body)
+    s1_route = method == "POST" and clean not in SHELL_ALLOWLIST and (
+        (clean in _UPLOAD_ROUTES and (p2s.get("hit") or has_progress))
+        or has_progress)
+    # One-request racer (orange / 0xd0ff9): same POST also carries an LFI param
+    # → record S1 then fall through to the LFI/S2 check below.
+    s1_fallthrough = False
+    lfi_probe_for_s1 = _lfi_param_target(query) if s1_route else ""
+    if s1_route:
+        meta = extract_multipart_meta(
+            body or b"", p2s.get("content_type") or "")
+        sample = persist_body_sample(body or b"")
+        st = note_s1(
+            sid,
+            progress_name=p2s.get("progress_name") or "",
+            body_prefix=body or b"",
+            payload_urls=p2s.get("payload_urls"),
+            declared_length=declared,
+            src_ip=src_ip,
+            ua=ua,
+        )
+        if apply_s1_delay:
+            try:
+                time.sleep(s1_delay_sec())
+            except Exception:
+                pass
+        # OOM sticky-once when flag on + huge CL + progress
+        if (oom_shape_enabled()
+                and declared >= OOM_SHAPE_CL
+                and not st.get("oom_fired")):
+            st = touch_state(sid, oom_fired=True)
+            research.update(research_event_fields(st, p2s, meta, sample))
+            cookie, research = maybe_attach_fake_leak(st, cookie, research)
+            return (php2shell_oom_fatal_html(), "text/html; charset=utf-8",
+                    500, cookie, "oom_fatal_500", "oom_producer_shape",
+                    research)
+        # Partial / idle-timeout body: progress was in the first bytes,
+        # sensor drained/held the rest. State still exists for the include.
+        body_meta = p2s.get("http_body_meta") or {}
+        if p2s.get("worker_hold") or body_meta.get("worker_hold") or (
+                "php2shell-worker-hold" in (p2s.get("tags") or [])):
+            st = touch_state(sid, s1_partial_body=True)
+            research["s1_partial_body"] = True
+            research["s1_partial_reason"] = (
+                p2s.get("worker_hold_reason")
+                or body_meta.get("worker_hold_reason") or "worker_hold")[:40]
+        if clean not in _UPLOAD_ROUTES:
+            research["s1_progress_anywhere"] = clean[:120]
+        if lfi_probe_for_s1:
+            research.update(research_event_fields(st, p2s, meta, sample))
+            research["s1_one_request_race"] = True
+            cookie, research = maybe_attach_fake_leak(st, cookie, research)
+            s1_fallthrough = True
+        if not s1_fallthrough:
             html = s1_soft_fail_html(
                 company, st.get("progress_name") or "", sid)
             research.update(research_event_fields(st, p2s, meta, sample))
@@ -1625,8 +1726,9 @@ def route(path, method="GET", query="", sessid="", body=b"", p2s=None,
             return (html, "text/html; charset=utf-8", 200, cookie,
                     "soft_fail_200", "s1_upload", research)
 
-    # S4: scoped second-stage fetch attempt
-    if _s4_should_trigger(clean, query, body):
+    # S4: scoped second-stage fetch attempt (not on the S1 racer POST itself;
+    # S1 path only logs S4 body indicators).
+    if not s1_fallthrough and _s4_should_trigger(clean, query, body):
         st = touch_state(sid, stage="s4_seen")
         delta = None
         if st.get("s1_at"):
@@ -1689,6 +1791,13 @@ def route(path, method="GET", query="", sessid="", body=b"", p2s=None,
         if st.get("s1_at"):
             delta = int((time.time() - float(st["s1_at"])) * 1000)
         blob = s2_session_blob(st)
+        # Optional synthetic php://filter base64 wrapper: we base64 OUR fake
+        # blob; nothing real is filtered/included/opened.
+        if sess_path_sid_from_lfi and _is_php_filter_b64(lfi_target):
+            import base64
+            blob = base64.b64encode(blob.encode("latin-1", "replace")).decode(
+                "ascii")
+            research["php_filter_b64"] = True
         # Red Delta B: raw sess_* → bare text/plain; omit X-Powered-By upstream
         if sess_path_sid:
             ctype = "text/plain"

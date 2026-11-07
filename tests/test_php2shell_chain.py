@@ -228,7 +228,8 @@ def main():
                       "urllib.request" not in src and "http.client" not in src)
 
     # TTL research profile
-    failures += check("ttl_300", c.STATE_TTL_SEC == 300)
+    # 2026-11-07 kit-walls fix: 300 → 900 (15 min repeat window)
+    failures += check("ttl_900", c.STATE_TTL_SEC == 900)
 
     # --- Delta A: evil"break framing ---
     evil = 'evil"break'
@@ -297,6 +298,8 @@ def main():
     # --- FAKE_LEAK default-on sticky-once, vary by family ---
     c.reset_state_for_tests()
     os.environ.pop("ANGLERFISH_PHP2SHELL_FAKE_LEAK", None)  # default ON
+    # Legacy leak tests use plain tokens (LEAKMARK1); opt in to old swap.
+    os.environ["ANGLERFISH_PHP2SHELL_LEAK_PLAIN_TOKEN"] = "1"
     failures += check("fake_leak_default_on", c.fake_leak_enabled())
     p2s_lk = phpapp.inspect_php2shell(
         "Content-Type: multipart/form-data\r\n",
@@ -446,6 +449,7 @@ def main():
     # --- BLOCKER fix: junk Set-Cookie still reaches S3/fake-shell ---
     c.reset_state_for_tests()
     os.environ.pop("ANGLERFISH_PHP2SHELL_FAKE_LEAK", None)  # default ON
+    os.environ["ANGLERFISH_PHP2SHELL_LEAK_PLAIN_TOKEN"] = "1"
     os.environ["ANGLERFISH_PHP2SHELL_NO_FLAKE"] = "1"
     orig_sid = "leakmapSID0011223344"
     p2s_map = phpapp.inspect_php2shell(

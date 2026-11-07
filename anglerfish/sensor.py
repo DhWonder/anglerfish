@@ -1431,10 +1431,20 @@ class Sensor(object):
                     tags.append("php2shell-worker-hold")
                 p2s["tags"] = tags
                 p2s["hit"] = True
+                # 2026-11-07 kit-walls fix: hand the partial-body signal to
+                # php2shell_chain.route so S1 is noted from the capped prefix
+                # (progress field is in the first bytes). Cap+drain unchanged.
+                p2s["worker_hold"] = True
+                p2s["worker_hold_reason"] = (
+                    _meta.get("worker_hold_reason") or "idle_timeout")[:40]
                 session["events"].append(_event(
                     "php2shell-worker-hold",
                     (_meta.get("worker_hold_reason")
                      or "idle_timeout")[:80]))
+                if p2s.get("has_upload_progress"):
+                    session["events"].append(_event(
+                        "php2shell-s1-partial-body",
+                        "progress seen in prefix; body incomplete"))
             session["php2shell"] = p2s
             if p2s.get("hit"):
                 session["events"].append(_event(
